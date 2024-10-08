@@ -515,29 +515,3 @@ def spherical_angle(lonA, latA, lonB, latB, lonC, latC):
     c = distance_on_unit_sphere(lonA, latA, lonB, latB, R=1.)
         
     return np.arccos(np.clip((np.cos(a) - np.cos(b)*np.cos(c))/(np.sin(b)*np.sin(c)), -1., 1.))
-
-def arc_path_range(lon1, lat1, lon2, lat2, N, start=0., stop=1.):
-    r = np.linspace(start, stop, N)
-    return arc_path(lon1, lat1, lon2, lat2, r)
-    
-def arc_path(lon1, lat1, lon2, lat2, r):
-    r = np.clip(r, 0., 1.)
-    
-    lam1 = np.deg2rad(lon1)
-    lam2 = np.deg2rad(lon2)
-    
-    phi1 = np.deg2rad(lat1)
-    phi2 = np.deg2rad(lat2)
-    
-    arc = distance_on_unit_sphere(lam1, lam2, phi1, phi2, R=1.)
-    
-    A = np.sin((1-r)*arc)/np.sin(arc)
-    B = np.sin(r*arc)/np.sin(arc)
-    x = A*np.cos(phi1)*np.cos(lam1) + B*np.cos(phi2)*np.cos(lam2)
-    y = A*np.cos(phi1)*np.sin(lam1) + B*np.cos(phi2)*np.sin(lam2)
-    z = A*np.sin(phi1) + B*np.sin(phi2)
-
-    lons = np.rad2deg(np.arctan2(y, x))
-    lats = np.rad2deg(np.arctan2(z, np.sqrt(x**2 + y**2)))
-    
-    return lons, lats
