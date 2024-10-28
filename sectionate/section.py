@@ -3,6 +3,114 @@ import xarray as xr
 
 from .gridutils import get_geo_corners, check_symmetric
 
+class Section():
+    """A named hydrographic section"""
+    def __init__(self, name, coords, children = {}, parents = {}):
+        """Initiate named hydrographic section
+
+        Arguments
+        ---------
+        name [str] -- name of the section
+        coords [list or tuple] -- coordinates that define the section
+        
+            If type is list, elements of the list must all be 2-tuples
+            of the form (lon, lat).
+            
+            If type is tuple, it must be of the form (lons, lats), where
+            lons and lats are lists of np.ndarray instances of the same
+            length with elements of type float.
+
+        children [mapping from str to Section (default: {})] -- dictionary
+            mapping the names of child sections to their Section instances.
+            This attribute will generally be populated automatically from
+            the function `join_sections`.
+
+        parents [mapping from str to Section (default: {})] -- To do
+
+        Returns
+        -------
+        instance of Section
+
+        Examples
+        --------
+        >>> sec.Section("Bering Strait", [(-170.3, 66.1), (-167.6,65.7)])
+        Section(Bering Strait, [(-170.3, 66.1), (-167.6, 65.7)])
+        """
+        self.name = name
+        if type(coords) is tuple:
+            if len(coords) == 2:
+                self.update_coords(coords_from_lonlat(coords[0], coords[1]))
+            else:
+                raise ValueError("If coords is a tuple, must be (lons, lats)")
+        elif type(coords) is list:
+            if all([(type(c) is tuple) and (len(c)==2) for c in coords]):
+                self.coords = coords.copy()
+                self.lons, self.lats = lonlat_from_coords(self.coords)
+            else:
+                raise ValueError("If coords is a list, its elements must be (lon,lat) 2-tuples")
+        else:
+            raise ValueError("coords must be a 2-tuple of lists/arrays or a list of 2-tuples")
+            
+        self.children = children.copy()
+        self.parents = parents.copy()
+        self.save = {}
+
+    def reverse(self):
+        """Reverse the section's direction"""
+        self.update_coords(self.coords[::-1])
+        return self
+
+    def update_coords(self, coords):
+        """Update coordinates (including longitude and latitude arrrays)"""
+        self.coords = coords
+        self.lons, self.lats = lonlat_from_coords(self.coords)
+
+    def copy(self):
+        """Create a deep copy of the Section instance"""
+        section = Section(
+            self.name,
+            self.coords,
+            children=self.children,
+            parents=self.parents
+        )
+        section.save = self.save.copy()
+        return section
+    
+    def __repr__(self):
+        summary = f"Section({self.name}, {self.coords})"
+        if len(self.children) > 0:
+            child_list = "\n".join([f"  - {s}" for s in self.children.values()])
+            summary += f"\n Children:\n{child_list}"
+        return summary
+
+def join_sections(name, *sections, **kwargs):
+    if type(name) is not str:
+        raise ValueError("first arugment (name) must be a str.")
+    align = kwargs["align"] if "align" in kwargs else True
+    extend = kwargs["extend"] if "extend" in kwargs else False
+    
+    section = Section(name, sections[0].coords)
+    if len(sections) > 1:
+        for i, s in enumerate(sections[1:], start=1):
+            if not(align):
+                coords1, coords2 = section.coords, s.coords
+            else:
+                coords1, coords2 = align_coords(
+                    section.coords,
+                    s.coords,
+                    extend=extend
+                )
+
+            s.update_coords(coords2)
+            section.update_coords(coords1 + coords2)
+            
+            if i == 1:
+                sections[0].update_coords(coords1)
+                section.children[sections[0].name] = sections[0]
+            section.children[s.name] = s
+            
+    return section
+        
 def grid_section(grid, lons, lats, topology="latlon"):
     """
     Compute composite section along model `grid` velocity faces that approximates geodesic paths
@@ -515,3 +623,57 @@ def spherical_angle(lonA, latA, lonB, latB, lonC, latC):
     c = distance_on_unit_sphere(lonA, latA, lonB, latB, R=1.)
         
     return np.arccos(np.clip((np.cos(a) - np.cos(b)*np.cos(c))/(np.sin(b)*np.sin(c)), -1., 1.))
+
+def align_coords(coords1, coords2, extend=False):
+    """Align coords1 and coords2 by minimizing distance between coords[-1] and coords[0]
+
+    Arguments
+    ---------
+    coords1 [list of (lon,lat) tuples] -- 
+    coords2 [list of (lon,lat) tuples] --
+
+    Returns
+    -------
+    (coords1, coords2)
+
+    Examples
+    --------
+    >>> coords1 = [(-100, 0), (-50, 0)]
+    >>> coords2 = [(   0, 0), (-40, 0)]
+    >>> sec.align_coords(coords1, coords2)
+    
+    """
+    coords_options = [
+        [coords1      , coords2      ],
+        [coords1[::-1], coords2      ],
+        [coords1      , coords2[::-1]],
+        [coords1[::-1], coords2[::-1]]
+    ]
+    dists = np.array([
+        coord_distance(c1[-1], c2[0])
+        for (c1,c2) in coords_options
+    ])
+    coords1, coords2 = coords_options[np.argmin(dists)]
+    if extend:
+        coords1 = [coords2[-1]] + coords1 + [coords2[0]]
+    return coords1, coords2
+
+def coord_distance(coord1, coord2):
+    """Spherical distance between coord1 and coord2"""
+    return distance_on_unit_sphere(
+        coord1[0],
+        coord1[1],
+        coord2[0],
+        coord2[1]
+    )
+
+def lonlat_from_coords(coords):
+    """Turns list of coordinate pairs into arrays of longitudes and latitudes"""
+    return (
+            np.array([lon for (lon, lat) in coords]),
+            np.array([lat for (lon, lat) in coords])
+        )
+
+def coords_from_lonlat(lons, lats):
+    """Turns iterable longitudes and latitudes into a list of coordinate pairs"""
+    return [(lon, lat) for (lon, lat) in zip(lons, lats)]
