@@ -138,14 +138,8 @@ class GriddedSection(Section):
         self.grid = grid
         self.f_c = f_c
         if isinstance(i_c, (list, np.ndarray)) & isinstance(j_c, (list, np.ndarray)):
-            # Indices supplied directly (a hand-built section, a copy, or one reloaded
-            # from disk) are normalised here too, so the "consecutive corners are
-            # distinct physical points" invariant holds at every entry point and not
-            # only in `grid_section`. Sections saved before this normalisation existed
-            # can contain both identities of a seam corner; this drops the redundant one.
-            self.i_c, self.j_c, self.f_c, _, _ = drop_repeated_corners(
-                grid, i_c, j_c, f_c
-            )
+            self.i_c = i_c
+            self.j_c = j_c
         else:
             self.grid_section()
 
@@ -314,13 +308,6 @@ def grid_section(grid, lons, lats, curve="great circle"):
     return i_c, j_c, lons_c, lats_c
 
 
-def _has_corner_topology(grid):
-    """Whether a multi-tile `grid` carries the tracer-center coordinates that the
-    corner-node topology (`gridutils.outer_topology`) is built from. Mirrors the
-    same test in `gridutils.build_neighbor_maps`."""
-    return all("center" in grid.axes[ax].coords for ax in ("X", "Y"))
-
-
 def drop_repeated_corners(grid, i_c, j_c, f_c=None):
     """
     Normalise a traced grid path so that consecutive corners are always distinct
@@ -334,8 +321,8 @@ def drop_repeated_corners(grid, i_c, j_c, f_c=None):
     than by floating-point rounding. The resulting hand-off step spans no grid cell, so
     that pair of corners does not define a velocity face.
 
-    This function removes the redundant identity immediately after the path is traced,
-    so that every section the public API hands out satisfies:
+    `grid_section` calls this immediately after the path is traced, so that every section
+    it returns satisfies:
 
     * no two consecutive corners are the same physical point -- every consecutive pair
       is a real velocity face; and
@@ -349,6 +336,9 @@ def drop_repeated_corners(grid, i_c, j_c, f_c=None):
     indices they would have had if the walk had never changed frame: the face after
     the seam is untouched, and the face before it is re-expressed as a wrapped step,
     which the index arithmetic in `transports.uvindices_from_qindices` already handles.
+
+    `uvindices_from_qindices` requires this invariant and checks it, so hand-built index
+    arrays that were not produced by `grid_section` can be passed through here first.
 
     PARAMETERS:
     -----------
@@ -372,17 +362,6 @@ def drop_repeated_corners(grid, i_c, j_c, f_c=None):
     geocorners = get_geo_corners(grid)
     glon = np.asarray(geocorners["X"].values)
     glat = np.asarray(geocorners["Y"].values)
-
-    if f_c is not None and not _has_corner_topology(grid):
-        # A multi-tile grid without tracer-center coordinates has no corner-node table
-        # to canonicalise against (`build_neighbor_maps` falls back to reading xgcm's
-        # corner halos for these). Its two identities of a shared boundary corner are
-        # separate indices on separate faces with no common index to collapse to, and
-        # dropping one would leave a step that is not a neighbor step. Such a grid
-        # carries no velocities either -- `uvindices_from_qindices` needs the centers,
-        # so no face is ever derived from it -- so the path is left as traced.
-        return (i_c, j_c, f_c,
-                np.asarray(glon[f_c, j_c, i_c]), np.asarray(glat[f_c, j_c, i_c]))
 
     if f_c is not None:
         # Multi-tile: identity is exact and purely topological -- two indices denote
@@ -431,6 +410,16 @@ def _check_supported_topology(grid):
     connects to itself along the "Y" axis) is not supported. Use the single-tile bipolar-fold
     padding instead -- ``padding={"X": "periodic", "Y": {"fold": "corner"}}`` (xgcm >= the
     bipolar-fold release) -- which sectionate handles natively via xgcm's fold padding.
+
+    A multi-tile grid must also register a cell-center dimension on both horizontal axes.
+    That is what the corner-node topology is reconstructed from (`gridutils.outer_topology`
+    fingerprints each corner by the tracer cells around it, because cells -- unlike corner
+    arrays -- pad reliably across any seam), and it is also where half of each velocity's
+    dimensions live: U sits at (X-corner, Y-center) and V at (X-center, Y-corner). Only the
+    *dimensions* are needed, not tracer longitudes/latitudes. Without them a multi-tile grid
+    can carry no velocities and its seam corners cannot be resolved to a single identity, so
+    a section across a seam could not be traced correctly; refuse it at the front door rather
+    than return a path whose seam steps are wrong.
     """
     facedim = grid._facedim
     connections = (getattr(grid, "_face_connections", None) or {}).get(facedim, {})
@@ -447,6 +436,20 @@ def _check_supported_topology(grid):
                         "supported. Build the grid as a single tile with the fold expressed as "
                         "padding instead: padding={'X':'periodic','Y':{'fold':'corner'}}."
                     )
+
+    missing = [ax for ax in ("X", "Y") if "center" not in grid.axes[ax].coords]
+    if missing:
+        raise ValueError(
+            "Multi-tile grids (`face_connections`) must register a cell-center dimension on "
+            f"both horizontal axes; {' and '.join(missing)} declare none. Sectionate rebuilds "
+            "the shared-corner topology from the tracer cells around each corner, and the "
+            "velocities themselves are staggered onto the center dimensions (U at (X-corner, "
+            "Y-center), V at (X-center, Y-corner)), so a grid without them carries no "
+            "velocities and its seam corners cannot be identified. Declare them, e.g. "
+            "coords={'X': {'center': 'xh', 'outer': 'xq'}, "
+            "'Y': {'center': 'yh', 'outer': 'yq'}} -- the center entries need only name "
+            "dimensions of the dataset, they need not carry coordinate values."
+        )
 
 def create_section_composite(
     gridlon,

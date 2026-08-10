@@ -142,8 +142,27 @@ def coord_dict(grid):
     dict
         Dictionary containing names of "X" and "Y" dimension variables, at both cell 'center'
         position and the corner position ('outer', 'right', or 'left'; see `corner_position`).
+
+    Raises
+    ------
+    ValueError
+        If either horizontal axis registers no 'center' position. Velocities are staggered
+        onto the center dimensions -- U lives at (X-corner, Y-center) and V at (X-center,
+        Y-corner) -- so a grid without them cannot locate any velocity, and anything that
+        derives faces, transports or tracers from a section needs this mapping.
     """
     corner_pos = corner_position(grid)
+
+    missing = [ax for ax in ("X", "Y") if "center" not in grid.axes[ax].coords]
+    if missing:
+        raise ValueError(
+            f"The {' and '.join(missing)} axis of this grid registers no 'center' "
+            "position, so sectionate cannot locate its velocities: U is stored at "
+            "(X-corner, Y-center) and V at (X-center, Y-corner). Declare the cell-center "
+            "dimensions, e.g. coords={'X': {'center': 'xh', 'outer': 'xq'}, "
+            "'Y': {'center': 'yh', 'outer': 'yq'}}. (Tracing a section with "
+            "`grid_section` needs only the corner coordinates and works without them.)"
+        )
 
     return {
         "X": {
@@ -256,15 +275,20 @@ def build_neighbor_maps(grid, geocorners):
         has_centers = all("center" in grid.axes[ax].coords for ax in ("X", "Y"))
         if has_centers:
             return outer_topology(grid).maps
-        # Without tracer-center coordinates the cell-identity construction is
-        # unavailable (and neither are velocities, so only walking is needed):
-        # fall back to reading xgcm's corner halos directly. Only shared-corner
-        # ('outer') tilings are safe here -- staggered corner arrays can pad one
-        # corner off across rotated/reversed seams.
+        # The cell-identity construction fingerprints each corner by the tracer cells
+        # around it, so it needs the cell-center *dimensions* (their names and lengths;
+        # no tracer longitude/latitude values are read). Without them, fall back to
+        # reading xgcm's corner halos directly. These maps step through each face's own
+        # copy of a shared seam corner, so a section traced on them would keep the
+        # zero-length hand-off step; `section.grid_section` therefore refuses a
+        # multi-tile grid with no center dimensions, and this fallback only ever serves
+        # a direct `build_neighbor_maps` call. Only shared-corner ('outer') tilings are
+        # safe here -- staggered corner arrays can pad one corner off across
+        # rotated/reversed seams.
         if corner_position(grid) != "outer":
             raise ValueError(
                 "Multi-tile grids with staggered ('left'/'right') corners require "
-                "tracer-center coordinates to derive their corner topology."
+                "cell-center dimensions to derive their corner topology."
             )
         return _multitile_padded_maps(grid, geocorners)
     da = geocorners["X"]
@@ -313,7 +337,7 @@ def build_neighbor_maps(grid, geocorners):
 def _multitile_padded_maps(grid, geocorners):
     """
     Fallback multi-tile neighbor maps for shared-corner ('outer') tilings that
-    carry no tracer-center coordinates: pad index-valued corner arrays with
+    register no cell-center dimensions: pad index-valued corner arrays with
     xgcm's `face_connections` halos and read the neighbors off directly. A
     shared seam corner is stored on every face that touches it, so these maps
     step through each face's own copy (seam-twin semantics); `_validate_reciprocity`

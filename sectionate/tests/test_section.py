@@ -220,41 +220,55 @@ def test_zero_length_seam_corner_dropped_by_section_finding():
         assert again[1].tolist() == j_c.tolist()
 
 
-def test_legacy_saved_seam_section_is_normalised_on_load(tmp_path):
-    """A section saved before the seam hand-off was dropped in section-finding holds BOTH
-    identities of the seam vertex. Reloading it must re-establish the invariant, so a
-    reloaded legacy section is indistinguishable from a freshly traced one -- the drop
-    does not depend on having just run the walk."""
-    import json
-    from sectionate.section import grid_section
-    from sectionate.utils import load_gridded_section
+def test_repeated_corner_raises_rather_than_inventing_a_face():
+    """`uvindices_from_qindices` requires the section-finding invariant instead of
+    re-establishing it, so it must CHECK rather than assume: a hand-built path that steps
+    through both identities of the seam vertex has to raise. Silently deriving a face from
+    that pair would invent a duplicate of a neighbouring face and double-count its flux."""
+    from sectionate.section import grid_section, drop_repeated_corners
     from sectionate.transports import uvindices_from_qindices
 
     g = _symmetric_periodic_grid()
-    i_c, j_c, lons_c, lats_c = grid_section(g, [315., 45.], [0., 0.])
+    i_c, j_c, _, _ = grid_section(g, [315., 45.], [0., 0.])
     assert i_c.tolist() == [7, 0, 1]
 
-    # what the old code wrote: the walk's raw output, with the doubled seam corner
-    legacy = {
-        "name": "seam", "i_c": [7, 8, 0, 1], "j_c": [1, 1, 1, 1],
-        "lons_c": [315., 360., 0., 45.], "lats_c": [0., 0., 0., 0.], "f_c": None,
-    }
-    path = str(tmp_path / "legacy.json")
-    with open(path, "w") as fh:
-        json.dump(legacy, fh)
+    # the raw walk, stepping through both identities of the seam vertex (360 == 0)
+    bad_i, bad_j = [7, 8, 0, 1], [1, 1, 1, 1]
+    with pytest.raises(ValueError, match="same physical point"):
+        uvindices_from_qindices(g, bad_i, bad_j)
 
-    gs = load_gridded_section(path, g)
-    assert np.asarray(gs.i_c).tolist() == i_c.tolist()
-    assert np.asarray(gs.j_c).tolist() == j_c.tolist()
-    # coordinates stay in step with the indices
-    assert len(gs.lons_c) == len(gs.i_c)
-    assert np.allclose(gs.lons_c, lons_c)
+    # `drop_repeated_corners` is the documented remedy, and recovers the traced section
+    fixed_i, fixed_j, fixed_f, _, _ = drop_repeated_corners(g, bad_i, bad_j)
+    assert fixed_f is None
+    assert fixed_i.tolist() == i_c.tolist()
+    assert fixed_j.tolist() == j_c.tolist()
 
-    # and it yields the same faces as the freshly traced section
-    uv_new = uvindices_from_qindices(g, i_c, j_c)
-    uv_loaded = uvindices_from_qindices(g, gs.i_c, gs.j_c)
-    for key in uv_new:
-        assert np.array_equal(uv_new[key], uv_loaded[key])
+
+def test_gridded_section_roundtrips_through_save_load(tmp_path):
+    """A section written by `save_gridded_section` already satisfies the invariant, so
+    loading it neither needs to nor does change it, and it yields identical faces."""
+    import json
+    from sectionate.section import Section, GriddedSection
+    from sectionate.utils import save_gridded_section, load_gridded_section
+    from sectionate.transports import uvindices_from_qindices
+
+    g = _symmetric_periodic_grid()
+    gs = GriddedSection(Section("seam", ([315., 45.], [0., 0.])), g)
+
+    path = str(tmp_path / "gs.json")
+    save_gridded_section(path, gs)
+    with open(path) as fh:
+        assert json.load(fh)["i_c"] == [7, 0, 1]      # the file holds the normalised path
+
+    gs2 = load_gridded_section(path, g)
+    assert np.asarray(gs2.i_c).tolist() == np.asarray(gs.i_c).tolist()
+    assert np.asarray(gs2.j_c).tolist() == np.asarray(gs.j_c).tolist()
+    assert np.allclose(gs2.lons_c, gs.lons_c)
+
+    uv1 = uvindices_from_qindices(g, gs.i_c, gs.j_c)
+    uv2 = uvindices_from_qindices(g, gs2.i_c, gs2.j_c)
+    for key in uv1:
+        assert np.array_equal(uv1[key], uv2[key])
 
 
 def test_coincident_twin_termination():

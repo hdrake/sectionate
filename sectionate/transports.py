@@ -7,7 +7,7 @@ from .gridutils import (
     corner_offset, coord_dict, get_geo_corners, get_facedim, build_neighbor_maps,
     NEIGHBOR_DIRECTIONS,
 )
-from .section import distance_on_unit_sphere
+from .section import distance_on_unit_sphere, COINCIDENT_TOLERANCE_M
 
 
 def _edge_direction(A, neighbor_maps):
@@ -129,11 +129,12 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
     metadata ('outer', 'right', or 'left'; see `gridutils.corner_offset`).
 
     Every consecutive pair of corners must be a real velocity face, i.e. two *distinct*
-    physical points. Sections produced by `grid_section`, by `GriddedSection`, or reloaded
-    with `utils.load_gridded_section` satisfy this: the zero-length hand-off step between the
-    two identities of a seam corner is dropped when the section is traced (see
-    `section.drop_repeated_corners`). Hand-built index arrays that still contain such a pair
-    should be passed through `section.drop_repeated_corners` first.
+    physical points. Sections produced by `grid_section` satisfy this: the zero-length
+    hand-off step between the two identities of a seam corner is dropped when the section
+    is traced (see `section.drop_repeated_corners`). This is checked, not assumed -- an
+    index array that repeats a physical corner raises, because deriving a face from that
+    pair would invent one that does not exist. Pass hand-built indices through
+    `section.drop_repeated_corners` first.
 
     PARAMETERS:
     -----------
@@ -168,6 +169,27 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
     geocorners = get_geo_corners(grid)
     glon = np.asarray(geocorners["X"].values)
     glat = np.asarray(geocorners["Y"].values)
+
+    # Enforce the section-finding invariant. A pair of corners at the same physical point
+    # spans no grid cell, so it is not a velocity face; the index arithmetic below would
+    # nonetheless produce one (a spurious duplicate of a neighbouring face), so refuse it.
+    if i_c.size > 1:
+        if f_c is not None:
+            fq = np.asarray(f_c)
+            clon, clat = glon[fq, j_c, i_c], glat[fq, j_c, i_c]
+        else:
+            clon, clat = glon[j_c, i_c], glat[j_c, i_c]
+        repeated = distance_on_unit_sphere(
+            clon[:-1], clat[:-1], clon[1:], clat[1:]
+        ) <= COINCIDENT_TOLERANCE_M
+        if repeated.any():
+            k = int(np.flatnonzero(repeated)[0])
+            raise ValueError(
+                f"Section corners {k} and {k+1} are the same physical point, so they do "
+                "not define a velocity face. Sections from `grid_section` never contain "
+                "such a pair; pass hand-built indices through "
+                "`sectionate.drop_repeated_corners(grid, i_c, j_c, f_c)` first."
+            )
 
     nsec = i_c.size
     uvindices = {
