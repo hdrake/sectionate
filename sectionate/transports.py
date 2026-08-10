@@ -179,9 +179,12 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
             clon, clat = glon[fq, j_c, i_c], glat[fq, j_c, i_c]
         else:
             clon, clat = glon[j_c, i_c], glat[j_c, i_c]
+        # Strictly less than, matching `drop_repeated_corners` and the walker exactly: a
+        # pair this check rejects must be a pair normalisation would have removed, or a
+        # section straight from `grid_section` could fail the invariant it establishes.
         repeated = distance_on_unit_sphere(
             clon[:-1], clat[:-1], clon[1:], clat[1:]
-        ) <= COINCIDENT_TOLERANCE_M
+        ) < COINCIDENT_TOLERANCE_M
         if repeated.any():
             k = int(np.flatnonzero(repeated)[0])
             raise ValueError(
