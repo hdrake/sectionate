@@ -547,6 +547,82 @@ def test_save_load_roundtrip_preserves_face_indices(tmp_path):
     assert np.isclose(t1, t2)
 
 
+def test_section_never_repeats_a_shared_seam_corner():
+    """The corner where two tiles meet is stored on both of them. A section crossing the
+    seam must contain that physical corner exactly ONCE -- consecutive corners are always
+    distinct points, so every consecutive pair is a real velocity face and no zero-flux
+    placeholder is ever emitted."""
+    from sectionate.gridutils import outer_topology
+    from sectionate.transports import uvindices_from_qindices
+
+    grid = _two_face_transport_grid()
+    i_c, j_c, f_c, _, _ = grid_section(grid, [15., 165.], [0., 0.])
+    assert set(np.unique(f_c).tolist()) == {0, 1}          # it really crosses the seam
+
+    ot = outer_topology(grid)
+    nodes = ot.node_id[f_c, j_c + ot.t, i_c + ot.t]
+    assert (nodes >= 0).all()
+    assert np.all(nodes[1:] != nodes[:-1])                 # no repeated physical corner
+    # every corner is the canonical native index of its node
+    native = ot.node_native[nodes]
+    assert np.array_equal(native[:, 0], f_c)
+    assert np.array_equal(native[:, 1], j_c)
+    assert np.array_equal(native[:, 2], i_c)
+
+    uv = uvindices_from_qindices(grid, i_c, j_c, f_c=f_c)
+    assert uv["var"].size == i_c.size - 1                  # every pair is a face
+    assert set(np.unique(uv["var"]).tolist()) <= {"U", "V"}
+
+
+def test_legacy_saved_section_with_seam_twin_is_normalised_on_load(tmp_path):
+    """A multi-tile section saved before the seam hand-off was dropped in section-finding
+    steps through BOTH tiles' copies of a shared boundary corner. Reloading it must
+    collapse the pair back to the canonical corner, giving a path identical to a freshly
+    traced one and, crucially, the same transport."""
+    import json
+    from sectionate.gridutils import outer_topology
+    from sectionate.utils import load_gridded_section
+
+    grid = _two_face_transport_grid()
+    i_c, j_c, f_c, lons_c, lats_c = grid_section(grid, [15., 165.], [0., 0.])
+
+    # Rebuild what the old code would have written: after each corner that is stored on
+    # two tiles, re-insert the other tile's copy of it (the zero-length hand-off step).
+    ot = outer_topology(grid)
+    reps = {}
+    for f in range(ot.nf):
+        for j in range(ot.nyq):
+            for i in range(ot.nxq):
+                n = int(ot.node_id[f, j + ot.t, i + ot.t])
+                if n >= 0:
+                    reps.setdefault(n, []).append((f, j, i))
+
+    leg_i, leg_j, leg_f = [], [], []
+    for k in range(i_c.size):
+        cur = (int(f_c[k]), int(j_c[k]), int(i_c[k]))
+        leg_f.append(cur[0]); leg_j.append(cur[1]); leg_i.append(cur[2])
+        twins = [r for r in reps[int(ot.node_id[cur[0], cur[1] + ot.t, cur[2] + ot.t])]
+                 if r != cur]
+        if twins:
+            leg_f.append(twins[0][0]); leg_j.append(twins[0][1]); leg_i.append(twins[0][2])
+    assert len(leg_i) > i_c.size                           # the legacy path really is longer
+
+    path = str(tmp_path / "legacy.json")
+    with open(path, "w") as fh:
+        json.dump({"name": "legacy seam", "i_c": leg_i, "j_c": leg_j, "f_c": leg_f,
+                   "lons_c": [0.] * len(leg_i), "lats_c": [0.] * len(leg_i)}, fh)
+
+    gs = load_gridded_section(path, grid)
+    assert np.asarray(gs.i_c).tolist() == i_c.tolist()
+    assert np.asarray(gs.j_c).tolist() == j_c.tolist()
+    assert np.asarray(gs.f_c).tolist() == f_c.tolist()
+
+    kw = dict(utr="u", vtr="v", geometry="cartesian")
+    t_fresh = convergent_transport(grid, i_c, j_c, f_c, **kw)["conv_mass_transport"].values
+    t_legacy = convergent_transport(grid, gs.i_c, gs.j_c, gs.f_c, **kw)["conv_mass_transport"].values
+    np.testing.assert_array_equal(t_fresh, t_legacy)
+
+
 # ---------------------------------------------------------------------------
 # A registered vertical axis must not affect horizontal topology
 # ---------------------------------------------------------------------------

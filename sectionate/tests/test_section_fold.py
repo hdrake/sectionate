@@ -111,3 +111,43 @@ def test_fold_section_crosses_arctic_on_real_grid():
     assert np.all(np.abs(np.asarray(lats_c) - 80.0) < 1.0)
     # It reaches the northern fold row.
     assert j_c.max() == ds.yq.size - 1
+
+
+@pytest.mark.skipif(
+    not os.path.exists(_mom6_example_path()),
+    reason="MOM6 example dataset not present (download via examples/load_example_model_grid.py)",
+)
+def test_fold_grid_sections_contain_no_repeated_corner():
+    """On the real MOM6 tripolar grid, sections that cross the periodic seam used to carry
+    the seam meridian twice (it is stored as both corner column 0 and corner column nx).
+    `grid_section` now drops the redundant identity, so no consecutive pair of corners is
+    the same physical point and every consecutive pair is a real velocity face."""
+    from sectionate.section import distance_on_unit_sphere, COINCIDENT_TOLERANCE_M
+    from sectionate.transports import uvindices_from_qindices
+
+    ds = xr.open_dataset(_mom6_example_path())
+    coords = {"X": {"center": "xh", "outer": "xq"}, "Y": {"center": "yh", "outer": "yq"}}
+    fold = xgcm.Grid(ds, coords=coords, padding={"X": "periodic", "Y": {"fold": "corner"}},
+                     autoparse_metadata=False)
+
+    cases = [
+        # a closed Arctic polygon that crosses the seam twice
+        (dict(lons=[40., 60., 80., 40.], lats=[60., 60., 75., 60.]), {}),
+        # a full southern latitude circle, crossing the seam once
+        (dict(lons=[0., 120., 240., 360.], lats=[-60.] * 4), dict(curve="latitude circle")),
+        # a high-latitude circle that reaches the fold row
+        (dict(lons=np.arange(0., 365., 5.).tolist(), lats=[80.] * 73), {}),
+    ]
+    for section, kwargs in cases:
+        i_c, j_c, lons_c, lats_c = grid_section(
+            fold, section["lons"], section["lats"], **kwargs
+        )
+        edge = distance_on_unit_sphere(lons_c[:-1], lats_c[:-1], lons_c[1:], lats_c[1:])
+        assert np.all(edge > COINCIDENT_TOLERANCE_M), "section repeats a physical corner"
+
+        uv = uvindices_from_qindices(fold, i_c, j_c)
+        assert uv["var"].size == i_c.size - 1
+        assert set(np.unique(uv["var"]).tolist()) <= {"U", "V"}
+        # cell-center indices stay within the grid
+        assert np.all(uv["i"][uv["var"] == "V"] < ds.xh.size)
+        assert np.all(uv["j"][uv["var"] == "U"] < ds.yh.size)

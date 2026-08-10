@@ -5,6 +5,7 @@ from .gridutils import (
     get_geo_corners,
     get_facedim,
     build_neighbor_maps,
+    outer_topology,
 )
 
 # Two corner indices map to the same physical point on seams that fold or wrap (e.g.
@@ -137,8 +138,14 @@ class GriddedSection(Section):
         self.grid = grid
         self.f_c = f_c
         if isinstance(i_c, (list, np.ndarray)) & isinstance(j_c, (list, np.ndarray)):
-            self.i_c = i_c
-            self.j_c = j_c
+            # Indices supplied directly (a hand-built section, a copy, or one reloaded
+            # from disk) are normalised here too, so the "consecutive corners are
+            # distinct physical points" invariant holds at every entry point and not
+            # only in `grid_section`. Sections saved before this normalisation existed
+            # can contain both identities of a seam corner; this drops the redundant one.
+            self.i_c, self.j_c, self.f_c, _, _ = drop_repeated_corners(
+                grid, i_c, j_c, f_c
+            )
         else:
             self.grid_section()
 
@@ -284,11 +291,11 @@ def grid_section(grid, lons, lats, curve="great circle"):
     # grid's xgcm metadata by padding index arrays (see `build_neighbor_maps`).
     # Where a single physical corner carries two indices (a periodic seam, a shared
     # multi-tile boundary corner, or the fold seam), the walk simply steps through
-    # both; the resulting zero-length section edge carries no flux and is dropped when
-    # faces are derived (see `transports.uvindices_from_qindices`).
+    # both; that hand-off step spans no grid cell, so the extra identity is dropped
+    # right here, by `drop_repeated_corners`, before the section is returned.
     neighbor_maps = build_neighbor_maps(grid, geocorners)
 
-    return create_section_composite(
+    out = create_section_composite(
         geocorners["X"],
         geocorners["Y"],
         lons,
@@ -296,6 +303,124 @@ def grid_section(grid, lons, lats, curve="great circle"):
         neighbor_maps=neighbor_maps,
         curve=curve,
     )
+    if facedim is not None:
+        i_c, j_c, f_c = out[0], out[1], out[2]
+    else:
+        i_c, j_c, f_c = out[0], out[1], None
+
+    i_c, j_c, f_c, lons_c, lats_c = drop_repeated_corners(grid, i_c, j_c, f_c)
+    if f_c is not None:
+        return i_c, j_c, f_c, lons_c, lats_c
+    return i_c, j_c, lons_c, lats_c
+
+
+def _has_corner_topology(grid):
+    """Whether a multi-tile `grid` carries the tracer-center coordinates that the
+    corner-node topology (`gridutils.outer_topology`) is built from. Mirrors the
+    same test in `gridutils.build_neighbor_maps`."""
+    return all("center" in grid.axes[ax].coords for ax in ("X", "Y"))
+
+
+def drop_repeated_corners(grid, i_c, j_c, f_c=None):
+    """
+    Normalise a traced grid path so that consecutive corners are always distinct
+    physical points.
+
+    A single physical vorticity point can be stored under more than one index: the
+    duplicated seam column (or row) of a symmetric ('outer') periodic grid, a corner
+    shared by several tiles of a multi-tile grid, or the two coincident lips of a grid
+    cut. `infer_grid_path_from_geo` deliberately admits the "seam twin" of the corner
+    it is standing on, so that a seam crossing is decided by the grid's topology rather
+    than by floating-point rounding. The resulting hand-off step spans no grid cell, so
+    that pair of corners does not define a velocity face.
+
+    This function removes the redundant identity immediately after the path is traced,
+    so that every section the public API hands out satisfies:
+
+    * no two consecutive corners are the same physical point -- every consecutive pair
+      is a real velocity face; and
+    * on a multi-tile grid, every corner is the canonical native index of the physical
+      corner point it denotes (`_OuterTopology.node_native`), which is what lets the
+      velocity-face attribution look a corner up in either the source or the
+      destination face's frame.
+
+    Of the two identities of a seam point the LATER one is kept -- the frame the path
+    continues in. The faces on either side of the hand-off then keep exactly the
+    indices they would have had if the walk had never changed frame: the face after
+    the seam is untouched, and the face before it is re-expressed as a wrapped step,
+    which the index arithmetic in `transports.uvindices_from_qindices` already handles.
+
+    PARAMETERS:
+    -----------
+    grid: xgcm.Grid
+        Grid the path was traced on.
+    i_c, j_c: array-like of int
+        Vorticity-point indices along the "X" and "Y" dimensions.
+    f_c: array-like of int or None
+        Face indices for multi-tile grids (`face_connections`); None for single-tile.
+
+    RETURNS:
+    --------
+    i_c, j_c, f_c, lons_c, lats_c: np.ndarray
+        The normalised path and the coordinates of its corners (`f_c` is None for
+        single-tile grids).
+    """
+    i_c = np.asarray(i_c, dtype=np.int64)
+    j_c = np.asarray(j_c, dtype=np.int64)
+    f_c = None if f_c is None else np.asarray(f_c, dtype=np.int64)
+
+    geocorners = get_geo_corners(grid)
+    glon = np.asarray(geocorners["X"].values)
+    glat = np.asarray(geocorners["Y"].values)
+
+    if f_c is not None and not _has_corner_topology(grid):
+        # A multi-tile grid without tracer-center coordinates has no corner-node table
+        # to canonicalise against (`build_neighbor_maps` falls back to reading xgcm's
+        # corner halos for these). Its two identities of a shared boundary corner are
+        # separate indices on separate faces with no common index to collapse to, and
+        # dropping one would leave a step that is not a neighbor step. Such a grid
+        # carries no velocities either -- `uvindices_from_qindices` needs the centers,
+        # so no face is ever derived from it -- so the path is left as traced.
+        return (i_c, j_c, f_c,
+                np.asarray(glon[f_c, j_c, i_c]), np.asarray(glat[f_c, j_c, i_c]))
+
+    if f_c is not None:
+        # Multi-tile: identity is exact and purely topological -- two indices denote
+        # the same point iff they resolve to the same node of the corner graph.
+        ot = outer_topology(grid)
+        nodes = ot.node_id[f_c, j_c + ot.t, i_c + ot.t]
+        if (nodes < 0).any():
+            raise ValueError(
+                "Section contains indices that are not grid corners."
+            )
+        native = ot.node_native[nodes]
+        if (native[:, 0] < 0).any():
+            raise ValueError(
+                "Section passes through a corner point that is stored on no face of "
+                "the grid (e.g. a cube vertex or an unstored cap/cut corner), so it "
+                "has no native index."
+            )
+        f_c, j_c, i_c = native[:, 0].copy(), native[:, 1].copy(), native[:, 2].copy()
+        repeated = nodes[1:] == nodes[:-1]
+    else:
+        # Single tile: the seam twins of a periodic/fold boundary are separate indices
+        # with no shared identity to compare, so coincidence is measured physically.
+        # The tolerance sits far below any real grid spacing (see COINCIDENT_TOLERANCE_M).
+        lo, la = glon[j_c, i_c], glat[j_c, i_c]
+        repeated = distance_on_unit_sphere(
+            lo[:-1], la[:-1], lo[1:], la[1:]
+        ) < COINCIDENT_TOLERANCE_M
+
+    keep = np.ones(i_c.size, dtype=bool)
+    keep[:-1] = ~repeated                    # keep the LAST index of each run
+    i_c, j_c = i_c[keep], j_c[keep]
+    f_c = None if f_c is None else f_c[keep]
+
+    if f_c is not None:
+        lons_c, lats_c = glon[f_c, j_c, i_c], glat[f_c, j_c, i_c]
+    else:
+        lons_c, lats_c = glon[j_c, i_c], glat[j_c, i_c]
+    return i_c, j_c, f_c, np.asarray(lons_c), np.asarray(lats_c)
 
 
 def _check_supported_topology(grid):
@@ -359,6 +484,12 @@ def create_section_composite(
         (i_c, j_c[, f_c]) correspond to indices of vorticity points that define velocity faces;
         the face index f_c is only returned for multi-tile grids.
         (lons_c, lats_c) are the corresponding longitude and latitudes.
+
+        This is the raw walk: where a section crosses a seam whose corner is stored under
+        two indices, both are still present, and the step between them is not a velocity
+        face. `grid_section` (which has the `xgcm.Grid` this needs) drops the redundant
+        one via `drop_repeated_corners`; call that yourself if you use this routine
+        directly and intend to derive faces from the result.
     """
 
     # A face dimension (3-D corner arrays) marks a multi-tile grid, whose sections

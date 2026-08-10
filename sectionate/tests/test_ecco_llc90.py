@@ -83,6 +83,37 @@ def test_llc90_polar_cut_lips_share_nodes():
     assert shared, "no node shares native storage across tiles 0 and 3"
 
 
+def test_llc90_sections_contain_no_repeated_corner():
+    """Sections traced on the real LLC90 grid satisfy the public invariant: consecutive
+    corners are always distinct physical points -- so every consecutive pair is a real
+    velocity face -- and every corner is the canonical native index of its corner node,
+    which is what lets the face attribution read a corner in either face's frame."""
+    from sectionate.gridutils import outer_topology
+    from sectionate.section import grid_section
+    from sectionate.transports import uvindices_from_qindices
+
+    grid = _load_grid()
+    ot = outer_topology(grid)
+
+    for lat in (-70., 10., 70.):
+        i_c, j_c, f_c, _, _ = grid_section(
+            grid, [0., 90., 180., 270., 360.], [lat] * 5, curve="latitude circle"
+        )
+        nodes = ot.node_id[f_c, j_c + ot.t, i_c + ot.t]
+        assert (nodes >= 0).all()
+        assert np.all(nodes[1:] != nodes[:-1]), f"repeated corner at lat {lat}"
+
+        native = ot.node_native[nodes]
+        assert np.array_equal(native[:, 0], f_c)
+        assert np.array_equal(native[:, 1], j_c)
+        assert np.array_equal(native[:, 2], i_c)
+
+        # every consecutive pair yields a face, and all of them are real velocities
+        uv = uvindices_from_qindices(grid, i_c, j_c, f_c=f_c)
+        assert uv["var"].size == i_c.size - 1
+        assert set(np.unique(uv["var"]).tolist()) <= {"U", "V"}
+
+
 def test_llc90_face_corners_resolve_topologically():
     """Every native corner appears in the neighbour maps with the correct arity:
     building the maps requires resolving the four-tile-junction face corners via

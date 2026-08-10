@@ -2,6 +2,7 @@ import json
 import os
 
 from sectionate import Section, GriddedSection
+from sectionate.section import drop_repeated_corners
 
 def load_sections_from_catalog(filename):
     """
@@ -166,13 +167,16 @@ def load_gridded_section(filepath, grid):
     with open(filepath, "r") as f:
         data = json.load(f)
 
-    name = data["name"]
-    coords = (data["lons_c"], data["lats_c"])
-    section = Section(name,coords)
-    return GriddedSection(
-        section,
+    # A section saved before consecutive seam-corner duplicates were dropped in
+    # section-finding can still hold both identities of a seam point. Normalise the
+    # indices on load -- and take the corner coordinates from the normalised indices,
+    # so the reloaded path and its coordinates stay the same length.
+    i_c, j_c, f_c, lons_c, lats_c = drop_repeated_corners(
         grid,
-        i_c=data["i_c"],
-        j_c=data["j_c"],
-        f_c=data.get("f_c"),  # absent in files written before f_c was persisted -> None
+        data["i_c"],
+        data["j_c"],
+        data.get("f_c"),  # absent in files written before f_c was persisted -> None
     )
+
+    section = Section(data["name"], (lons_c, lats_c))
+    return GriddedSection(section, grid, i_c=i_c, j_c=j_c, f_c=f_c)

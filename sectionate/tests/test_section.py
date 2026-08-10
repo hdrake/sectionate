@@ -7,6 +7,7 @@ from sectionate.gridutils import (
     get_geo_corners,
     build_neighbor_maps,
 )
+from sectionate.section import drop_repeated_corners
 
 
 # define simple lat-lon grid
@@ -167,17 +168,13 @@ def test_infer_grid_path_requires_neighbor_maps():
         infer_grid_path_from_geo(0, 0, 1, 1, lon, lat, None)
 
 
-def test_zero_length_seam_face_dropped():
-    """On a symmetric periodic grid the seam vertex (360 == 0) carries two indices, so a
-    seam-crossing section has a doubled corner in i_c. The zero-length edge between the two
-    identities is not emitted as a velocity face, while the real faces on either side are."""
-    from sectionate.section import grid_section, distance_on_unit_sphere
-    from sectionate.transports import uvindices_from_qindices
-    N = 8
+def _symmetric_periodic_grid(N=8):
+    """A symmetric ('outer') X-periodic grid: the seam meridian is stored twice, once as
+    corner column 0 (lon 0) and once as corner column N (lon 360)."""
     xq = np.linspace(0., 360., N + 1); xh = 0.5 * (xq[:-1] + xq[1:])
     yq = np.array([-30., 0., 30.]); yh = np.array([-15., 15.])
     lon_c, lat_c = np.meshgrid(xq, yq); lon2, lat2 = np.meshgrid(xh, yh)
-    g = xgcm.Grid(
+    return xgcm.Grid(
         xr.Dataset(coords={
             "xq": np.arange(N + 1), "yq": np.arange(3), "xh": np.arange(N), "yh": np.arange(2),
             "geolon_c": (("yq", "xq"), lon_c), "geolat_c": (("yq", "xq"), lat_c),
@@ -186,18 +183,78 @@ def test_zero_length_seam_face_dropped():
         coords={"X": {"center": "xh", "outer": "xq"}, "Y": {"center": "yh", "outer": "yq"}},
         padding={"X": "periodic", "Y": "extend"}, autoparse_metadata=False,
     )
-    # short way from 315 deg to 45 deg runs east across the periodic seam
+
+
+def test_zero_length_seam_corner_dropped_by_section_finding():
+    """On a symmetric periodic grid the seam vertex (360 == 0) carries two indices, and the
+    walk steps through both. That pair spans no grid cell, so it is not a velocity face:
+    `grid_section` drops the redundant identity, so the section it returns never contains a
+    consecutive pair of corners at the same physical point, and every consecutive pair
+    becomes a face. The faces are the same ones the walk implied, in both directions."""
+    from sectionate.section import grid_section, distance_on_unit_sphere
+    from sectionate.transports import uvindices_from_qindices
+    g = _symmetric_periodic_grid()
+    # short way from 315 deg to 45 deg runs east across the periodic seam; the reverse
+    # section runs west across it.
+    for lons, expected_i, expected_faces in [
+        ([315., 45.], [7, 0, 1], [7, 0]),
+        ([45., 315.], [1, 8, 7], [0, 7]),
+    ]:
+        i_c, j_c, lons_c, lats_c = grid_section(g, lons, [0., 0.])
+
+        # The seam vertex survives exactly once: no consecutive pair is the same point.
+        edge_len = distance_on_unit_sphere(lons_c[:-1], lats_c[:-1], lons_c[1:], lats_c[1:])
+        assert np.all(edge_len > 1.e-3)
+        assert i_c.tolist() == expected_i
+
+        uv = uvindices_from_qindices(g, i_c, j_c)
+        # every consecutive pair of corners is now a face, and they are the two real
+        # faces flanking the seam vertex (index arithmetic wraps the seam crossing).
+        assert uv["var"].size == i_c.size - 1
+        assert np.all(uv["var"] == "V")
+        assert uv["i"].tolist() == expected_faces
+
+        # normalising an already-normalised path is a no-op
+        again = drop_repeated_corners(g, i_c, j_c)
+        assert again[0].tolist() == i_c.tolist()
+        assert again[1].tolist() == j_c.tolist()
+
+
+def test_legacy_saved_seam_section_is_normalised_on_load(tmp_path):
+    """A section saved before the seam hand-off was dropped in section-finding holds BOTH
+    identities of the seam vertex. Reloading it must re-establish the invariant, so a
+    reloaded legacy section is indistinguishable from a freshly traced one -- the drop
+    does not depend on having just run the walk."""
+    import json
+    from sectionate.section import grid_section
+    from sectionate.utils import load_gridded_section
+    from sectionate.transports import uvindices_from_qindices
+
+    g = _symmetric_periodic_grid()
     i_c, j_c, lons_c, lats_c = grid_section(g, [315., 45.], [0., 0.])
+    assert i_c.tolist() == [7, 0, 1]
 
-    edge_len = distance_on_unit_sphere(lons_c[:-1], lats_c[:-1], lons_c[1:], lats_c[1:])
-    n_degenerate = int(np.sum(edge_len < 1.e-3))
-    assert n_degenerate == 1                          # one zero-length edge at the seam vertex
-    assert i_c.size >= 4                               # the doubled corner is retained in i_c
+    # what the old code wrote: the walk's raw output, with the doubled seam corner
+    legacy = {
+        "name": "seam", "i_c": [7, 8, 0, 1], "j_c": [1, 1, 1, 1],
+        "lons_c": [315., 360., 0., 45.], "lats_c": [0., 0., 0., 0.], "f_c": None,
+    }
+    path = str(tmp_path / "legacy.json")
+    with open(path, "w") as fh:
+        json.dump(legacy, fh)
 
-    uv = uvindices_from_qindices(g, i_c, j_c)
-    # the degenerate edge is not a face; the flanking real faces are
-    assert uv["var"].size == (i_c.size - 1) - n_degenerate
-    assert np.all(uv["var"] != "0")
+    gs = load_gridded_section(path, g)
+    assert np.asarray(gs.i_c).tolist() == i_c.tolist()
+    assert np.asarray(gs.j_c).tolist() == j_c.tolist()
+    # coordinates stay in step with the indices
+    assert len(gs.lons_c) == len(gs.i_c)
+    assert np.allclose(gs.lons_c, lons_c)
+
+    # and it yields the same faces as the freshly traced section
+    uv_new = uvindices_from_qindices(g, i_c, j_c)
+    uv_loaded = uvindices_from_qindices(g, gs.i_c, gs.j_c)
+    for key in uv_new:
+        assert np.array_equal(uv_new[key], uv_loaded[key])
 
 
 def test_coincident_twin_termination():

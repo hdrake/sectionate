@@ -55,14 +55,16 @@ def test_periodic_grid_section():
     lonseg = np.array([300, 60])
     latseg = np.array([0, 0])
     i, j, lons, lats = grid_section(grid, lonseg, latseg)
-    # The seam vertex (360 == 0) is symmetric+periodic, so it carries two indices (6 and 0):
-    # the path steps through both, leaving a doubled corner. The zero-length edge between
-    # them carries no flux and is dropped when faces are derived (see uvindices_from_qindices).
+    # The seam vertex (360 == 0) is symmetric+periodic, so it carries two indices (6 and 0).
+    # The walk steps through both, but that hand-off spans no grid cell, so only one of the
+    # two identities survives into the section (`drop_repeated_corners` keeps the later one,
+    # index 0 -- the frame the path continues in). The seam vertex therefore appears exactly
+    # once, and every consecutive pair of corners is a real velocity face.
     assert np.all([
-        modequal(i, np.array([5, 6, 0, 1])),
-        modequal(j, np.array([2, 2, 2, 2])),
-        modequal(lons, np.array([300., 360., 0., 60.])),
-        modequal(lats, np.array([0.,   0.,   0., 0.]))
+        modequal(i, np.array([5, 0, 1])),
+        modequal(j, np.array([2, 2, 2])),
+        modequal(lons, np.array([300., 0., 60.])),
+        modequal(lats, np.array([0.,   0., 0.]))
     ])
 
 
