@@ -115,6 +115,113 @@ def _uv_for_edge(A, B, neighbor_maps, offset, ranges, glon, glat):
     return "0", 0, 0, int(fB), 0
 
 
+def _axis_periodic(grid, axis):
+    """Whether `axis` wraps, so its first and last index columns are neighbors."""
+    ax = grid.axes.get(axis)
+    return (ax is not None) and (ax.padding == "periodic")
+
+
+def _index_adjacent(ja, ia, jb, ib, ny, nx, y_periodic, x_periodic):
+    """
+    Whether two corners are neighbors in the *raw index* lattice -- the assumption the
+    single-tile velocity-face arithmetic in `uvindices_from_qindices` is built on. A
+    wrap across a periodic axis counts, since that arithmetic handles it explicitly.
+    """
+    dj, di = int(jb) - int(ja), int(ib) - int(ia)
+    if dj == 0 and di == 0:
+        return True                                  # degenerate; dropped downstream
+    if dj == 0:
+        return abs(di) == 1 or (x_periodic and abs(di) == nx - 1)
+    if di == 0:
+        return abs(dj) == 1 or (y_periodic and abs(dj) == ny - 1)
+    return False
+
+
+def _adjacent_candidates(j, i, ny, nx, y_periodic, x_periodic):
+    """Every corner index adjacent to (j,i) in the raw index lattice, in a fixed order."""
+    cand = [(j, i - 1), (j, i + 1), (j - 1, i), (j + 1, i)]
+    if x_periodic:
+        cand += [(j, 0), (j, nx - 1)]
+    if y_periodic:
+        cand += [(0, i), (ny - 1, i)]
+    out = []
+    for (jj, ii) in cand:
+        if ((0 <= jj < ny) and (0 <= ii < nx) and ((jj, ii) not in out)
+                and _index_adjacent(j, i, jj, ii, ny, nx, y_periodic, x_periodic)):
+            out.append((jj, ii))
+    return out
+
+
+def _insert_seam_twins(i_c, j_c, glon, glat, grid):
+    """
+    Splice in seam twins so that every consecutive pair of corners is index-adjacent.
+
+    A seam gives one physical corner two index representations. The bipolar north fold is
+    the single-tile case: it identifies each seam-row corner with its mirrored column, so
+    the walk can step from one representation straight to a corner adjacent to the *other*.
+    That pair is a real physical edge but not an index-adjacent one, and the arithmetic in
+    `uvindices_from_qindices` reads the velocity column off the source corner -- which is
+    then the wrong representative. It names the mirror image of the face the section
+    actually crossed, and (because the mirrored half runs the opposite way in index space)
+    with the opposite sign. On a closed fold-crossing section that also emits one face
+    twice, double-counting it.
+
+    Splicing the twin in restores the invariant the arithmetic needs: the crossing becomes
+    one ordinary edge plus one zero-length twin edge, and zero-length edges are dropped at
+    the end of `uvindices_from_qindices`, so nothing is counted twice. This is the
+    single-tile counterpart of the corner canonicalization `_OuterTopology` performs for
+    multi-tile grids; NEMO reaches the same place from the other direction, carrying the
+    duplicated points and masking them out of transports with `umaskutil`/`vmaskutil`.
+
+    Runs on every single-tile grid and is a no-op unless a step actually skips the twin, so
+    grids without seam duplicates (and fold sections that never cross the seam) are untouched.
+    """
+    if len(i_c) < 2:
+        return np.asarray(i_c), np.asarray(j_c)
+    ny, nx = glon.shape
+    y_periodic, x_periodic = _axis_periodic(grid, "Y"), _axis_periodic(grid, "X")
+
+    def coincident(ja, ia, jb, ib):
+        return distance_on_unit_sphere(
+            glon[ja, ia], glat[ja, ia], glon[jb, ib], glat[jb, ib]
+        ) < COINCIDENT_TOLERANCE_M
+
+    out_i, out_j = [int(i_c[0])], [int(j_c[0])]
+    for k in range(len(i_c) - 1):
+        ja, ia = int(j_c[k]), int(i_c[k])
+        jb, ib = int(j_c[k + 1]), int(i_c[k + 1])
+        if not _index_adjacent(ja, ia, jb, ib, ny, nx, y_periodic, x_periodic):
+            # Either a twin of A adjacent to B, or a twin of B adjacent to A, turns the
+            # step into two index-adjacent ones. Which of the two exists depends on
+            # whether the section is entering or leaving the seam.
+            twin = next(
+                (t for t in _adjacent_candidates(jb, ib, ny, nx, y_periodic, x_periodic)
+                 if coincident(*t, ja, ia)),
+                None,
+            )
+            if twin is None:
+                twin = next(
+                    (t for t in _adjacent_candidates(ja, ia, ny, nx, y_periodic, x_periodic)
+                     if coincident(*t, jb, ib)),
+                    None,
+                )
+            if twin is None:
+                raise ValueError(
+                    f"Section steps between corners (j={ja}, i={ia}) and (j={jb}, i={ib}), "
+                    "which are neither adjacent in index space nor separated by a seam twin, "
+                    "so the velocity face between them is undefined. On a grid with a bipolar "
+                    "fold this means the corner coordinates do not carry the fold symmetry the "
+                    "grid declares (the seam row's mirrored columns should hold identical "
+                    "coordinates)."
+                )
+            out_j.append(twin[0])
+            out_i.append(twin[1])
+        out_j.append(jb)
+        out_i.append(ib)
+
+    return np.asarray(out_i), np.asarray(out_j)
+
+
 def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
     """
     Find the `grid` indices of the N-1 velocity points defined by the consecutive indices of
@@ -171,6 +278,13 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
         keep[1:] = nodes[1:] != nodes[:-1]
         nat = ot.node_native[nodes[keep]]
         f_c, j_c, i_c = nat[:, 0].copy(), nat[:, 1].copy(), nat[:, 2].copy()
+    else:
+        # Single-tile grids have no face topology to canonicalize corners through, but
+        # they can still carry seam duplicates: a bipolar north fold identifies every
+        # seam-row corner with its mirrored column. Splice those twins in so that the
+        # index arithmetic below -- which assumes consecutive corners are index-adjacent
+        # -- reads the velocity face the section actually crossed. See `_insert_seam_twins`.
+        i_c, j_c = _insert_seam_twins(i_c, j_c, glon, glat, grid)
 
     nsec = i_c.size
     uvindices = {
