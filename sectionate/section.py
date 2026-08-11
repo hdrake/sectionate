@@ -5,6 +5,7 @@ from .gridutils import (
     get_geo_corners,
     get_facedim,
     build_neighbor_maps,
+    outer_topology,
 )
 
 # Two corner indices map to the same physical point on seams that fold or wrap (e.g.
@@ -317,10 +318,10 @@ def grid_section(grid, lons, lats, curve="great circle"):
     # All topologies -- periodic wrap, fill/extend walls, multi-tile face
     # connections, and the bipolar north fold -- are derived uniformly from the
     # grid's xgcm metadata by padding index arrays (see `build_neighbor_maps`).
-    # Where a single physical corner carries two indices (a periodic seam, a shared
+    # Where one physical corner is stored under two indices (a periodic seam, a shared
     # multi-tile boundary corner, or the fold seam), the walk simply steps through
-    # both; the resulting zero-length section edge carries no flux and is dropped when
-    # faces are derived (see `transports.uvindices_from_qindices`).
+    # both; that hand-off step spans no grid cell, so the redundant index is dropped
+    # right here, by `drop_repeated_corners`, before the section is returned.
     neighbor_maps = build_neighbor_maps(grid, geocorners)
 
     return create_section_composite(
@@ -330,7 +331,196 @@ def grid_section(grid, lons, lats, curve="great circle"):
         lats,
         neighbor_maps=neighbor_maps,
         curve=curve,
+        grid=grid,
     )
+
+
+def drop_repeated_corners(grid, i_c, j_c, f_c=None):
+    """
+    Normalise a traced grid path so that consecutive corners are always distinct
+    physical points.
+
+    A single physical vorticity point can be stored under more than one index: the
+    duplicated seam column (or row) of a symmetric ('outer') periodic grid, a corner
+    shared by several tiles of a multi-tile grid, the two coincident lips of a grid cut,
+    or the whole degenerate column where a bipolar cap converges on one of its poles.
+    `infer_grid_path_from_geo` deliberately admits the "seam twin" of the corner it is
+    standing on, so that a seam crossing is decided by the grid's topology rather than by
+    floating-point rounding. The resulting hand-off step spans no grid cell, so that pair
+    of corners does not define a velocity face.
+
+    `grid_section` calls this immediately after the path is traced, so that every section
+    it returns satisfies:
+
+    * no two consecutive corners are the same physical point -- every consecutive pair
+      is a real velocity face; and
+    * on a multi-tile grid, every corner is the canonical native index of the physical
+      corner point it denotes (`_OuterTopology.node_native`), which is what lets the
+      velocity-face attribution look a corner up in either the source or the
+      destination face's frame.
+
+    Of a repeated corner's several indices, the one kept is the one that names the same
+    two velocity faces as the run it replaces: the faces flanking the run keep exactly
+    the indices they would have had if the walk had never changed frame. On a multi-tile
+    grid that is automatic, since every index of a corner resolves to the same canonical
+    native one. On a single tile the LAST index of the run -- the frame the path continues
+    in -- is preferred and is what a seam hand-off needs; the earlier ones are tried in
+    turn if it does not serve, and a run that no single index can stand in for raises
+    (see `_collapse_single_tile_runs`).
+
+    `uvindices_from_qindices` requires this invariant and checks it, so hand-built index
+    arrays that were not produced by `grid_section` can be passed through here first.
+
+    PARAMETERS:
+    -----------
+    grid: xgcm.Grid
+        Grid the path was traced on.
+    i_c, j_c: array-like of int
+        Vorticity-point indices along the "X" and "Y" dimensions.
+    f_c: array-like of int or None
+        Face indices for multi-tile grids (`face_connections`); None for single-tile.
+
+    RETURNS:
+    --------
+    i_c, j_c, f_c, lons_c, lats_c: np.ndarray
+        The normalised path and the coordinates of its corners (`f_c` is None for
+        single-tile grids).
+    """
+    i_c = np.asarray(i_c, dtype=np.int64)
+    j_c = np.asarray(j_c, dtype=np.int64)
+    f_c = None if f_c is None else np.asarray(f_c, dtype=np.int64)
+
+    geocorners = get_geo_corners(grid)
+    glon = np.asarray(geocorners["X"].values)
+    glat = np.asarray(geocorners["Y"].values)
+
+    if f_c is not None:
+        # Multi-tile: which physical point an index denotes is exact and purely
+        # topological -- two indices denote the same point iff they resolve to the same
+        # node of the corner graph.
+        ot = outer_topology(grid)
+        nodes = ot.node_id[f_c, j_c + ot.t, i_c + ot.t]
+        if (nodes < 0).any():
+            raise ValueError(
+                "Section contains indices that are not grid corners."
+            )
+        native = ot.node_native[nodes]
+        if (native[:, 0] < 0).any():
+            raise ValueError(
+                "Section passes through a corner point that is stored on no face of "
+                "the grid (e.g. a cube vertex or an unstored cap/cut corner), so it "
+                "has no native index."
+            )
+        f_c, j_c, i_c = native[:, 0].copy(), native[:, 1].copy(), native[:, 2].copy()
+        # Every index of a corner has just been rewritten to the node's one canonical
+        # native index, so the members of a run are now identical: which one survives
+        # cannot matter, and the neighbour maps link canonical indices only.
+        repeated = nodes[1:] == nodes[:-1]
+        keep = np.ones(i_c.size, dtype=bool)
+        keep[:-1] = ~repeated
+    else:
+        # Single tile: the seam twins of a periodic/fold boundary are separate indices
+        # with nothing to compare them by, so coincidence is measured physically. The
+        # tolerance sits far below any real grid spacing (see COINCIDENT_TOLERANCE_M).
+        lo, la = glon[j_c, i_c], glat[j_c, i_c]
+        repeated = distance_on_unit_sphere(
+            lo[:-1], la[:-1], lo[1:], la[1:]
+        ) < COINCIDENT_TOLERANCE_M
+        keep = _collapse_single_tile_runs(grid, i_c, j_c, repeated)
+
+    i_c, j_c = i_c[keep], j_c[keep]
+    f_c = None if f_c is None else f_c[keep]
+
+    if f_c is not None:
+        lons_c, lats_c = glon[f_c, j_c, i_c], glat[f_c, j_c, i_c]
+    else:
+        lons_c, lats_c = glon[j_c, i_c], glat[j_c, i_c]
+    return i_c, j_c, f_c, np.asarray(lons_c), np.asarray(lats_c)
+
+
+def _collapse_single_tile_runs(grid, i_c, j_c, repeated):
+    """
+    Boolean mask keeping exactly one index out of each run of repeated corners in a
+    single-tile path (`repeated[k]` is True where corners k and k+1 are the same
+    physical point).
+
+    Collapsing a run replaces the index the path arrived at with the index it is left
+    under, so it is only safe when the surviving index still names the two velocity
+    faces that flank the run. That is checked, not assumed: the flanking faces are
+    derived from the raw path and from each candidate index, with
+    `transports._single_tile_face` -- the same arithmetic
+    `transports.uvindices_from_qindices` will apply -- and only an index reproducing
+    both is kept. Compared are the velocity (var, i, j) and the direction flag that
+    carries that face's transport sign ("Xinc" for a V face, "Yinc" for a U face; see
+    `convergent_transport`), so collapsing changes neither a face of the section nor
+    the sign of its transport.
+
+    Candidates are tried last-index-first, because for a seam hand-off (the common case,
+    where a run is just a corner's two seam-twin indices) the last one is the frame the
+    path continues in.
+
+    Where a whole grid column degenerates to one point -- the pole of a bipolar cap,
+    stored as every corner of a column -- a section can enter the point along one of its
+    indices and leave along another, far apart in the index lattice. Then no single index
+    names both flanking faces, and this raises rather than emit a face the section does
+    not have.
+    """
+    # Imported here, not at module scope: `transports` imports this module for the
+    # coincidence test, and the face arithmetic must have exactly one implementation.
+    from .transports import _single_tile_face, _single_tile_face_context
+
+    keep = np.ones(i_c.size, dtype=bool)
+    if not np.any(repeated):
+        return keep
+
+    context = _single_tile_face_context(grid)
+
+    def face(a, b):
+        """The velocity face between path positions a and b, with its transport sign."""
+        var, vi, vj, Xinc, Yinc = _single_tile_face(
+            int(i_c[a]), int(j_c[a]), int(i_c[b]), int(j_c[b]), *context
+        )
+        return var, vi, vj, (Xinc if var == "V" else Yinc)
+
+    n = i_c.size
+    start = 0
+    while start < n:
+        end = start
+        while end < n - 1 and repeated[end]:
+            end += 1
+        if end > start:
+            before = start - 1 if start > 0 else None
+            after = end + 1 if end + 1 < n else None
+            face_in = None if before is None else face(before, start)
+            face_out = None if after is None else face(end, after)
+            chosen = None
+            for r in range(end, start - 1, -1):
+                if before is not None and face(before, r) != face_in:
+                    continue
+                if after is not None and face(r, after) != face_out:
+                    continue
+                chosen = r
+                break
+            if chosen is None:
+                raise ValueError(
+                    f"Section corners {start}..{end} -- (i,j) "
+                    f"{(int(i_c[start]), int(j_c[start]))} through "
+                    f"{(int(i_c[end]), int(j_c[end]))} -- are all the same physical grid "
+                    "corner, a column that degenerates to a single point (a bipolar "
+                    "cap's pole). The section enters it from "
+                    f"{(int(i_c[before]), int(j_c[before]))} and leaves it towards "
+                    f"{(int(i_c[after]), int(j_c[after]))}, and no single index of that "
+                    "corner is adjacent to both, so no section with distinct consecutive "
+                    "corners can carry both of the velocity faces on either side. If this "
+                    "grid has a bipolar/tripolar fold, declare it -- "
+                    "padding={'Y': {'fold': 'corner'}} -- so the walk crosses the cap "
+                    "through the fold seam rather than through the pole column; that is "
+                    "what this arises from. Otherwise route the section around the pole."
+                )
+            keep[start:end + 1] = False
+            keep[chosen] = True
+        start = end + 1
+    return keep
 
 
 def _check_supported_topology(grid):
@@ -341,6 +531,16 @@ def _check_supported_topology(grid):
     connects to itself along the "Y" axis) is not supported. Use the single-tile bipolar-fold
     padding instead -- ``padding={"X": "periodic", "Y": {"fold": "corner"}}`` (xgcm >= the
     bipolar-fold release) -- which sectionate handles natively via xgcm's fold padding.
+
+    A multi-tile grid must also register a cell-center dimension on both horizontal axes.
+    That is what the corner-node topology is reconstructed from (`gridutils.outer_topology`
+    fingerprints each corner by the tracer cells around it, because cells -- unlike corner
+    arrays -- pad reliably across any seam), and it is also where half of each velocity's
+    dimensions live: U sits at (X-corner, Y-center) and V at (X-center, Y-corner). Only the
+    *dimensions* are needed, not tracer longitudes/latitudes. Without them a multi-tile grid
+    can carry no velocities and each of its seam corners cannot be resolved to one index, so
+    a section across a seam could not be traced correctly; refuse it at the front door rather
+    than return a path whose seam steps are wrong.
     """
     facedim = grid._facedim
     connections = (getattr(grid, "_face_connections", None) or {}).get(facedim, {})
@@ -358,6 +558,20 @@ def _check_supported_topology(grid):
                         "padding instead: padding={'X':'periodic','Y':{'fold':'corner'}}."
                     )
 
+    missing = [ax for ax in ("X", "Y") if "center" not in grid.axes[ax].coords]
+    if missing:
+        raise ValueError(
+            "Multi-tile grids (`face_connections`) must register a cell-center dimension on "
+            f"both horizontal axes; {' and '.join(missing)} declare none. Sectionate rebuilds "
+            "the shared-corner topology from the tracer cells around each corner, and the "
+            "velocities themselves are staggered onto the center dimensions (U at (X-corner, "
+            "Y-center), V at (X-center, Y-corner)), so a grid without them carries no "
+            "velocities and its seam corners cannot be identified. Declare them, e.g. "
+            "coords={'X': {'center': 'xh', 'outer': 'xq'}, "
+            "'Y': {'center': 'yh', 'outer': 'yq'}} -- the center entries need only name "
+            "dimensions of the dataset, they need not carry coordinate values."
+        )
+
 def create_section_composite(
     gridlon,
     gridlat,
@@ -365,6 +579,7 @@ def create_section_composite(
     lats,
     neighbor_maps,
     curve="great circle",
+    grid=None,
     ):
     """
     Compute composite section along velocity faces, as defined by coordinates of vorticity points (gridlon, gridlat),
@@ -391,6 +606,12 @@ def create_section_composite(
         "latitude circle", or "latitude and great circle". Each segment is resolved and
         checked independently; `sectionate.grid_section` documents what the three options
         mean and which segments they reject.
+    grid: xgcm.Grid or None
+        The grid `neighbor_maps` and (gridlon, gridlat) came from. Pass it to get a section
+        that satisfies the invariant the rest of the API expects -- no two consecutive
+        corners at the same physical point -- by normalizing the raw walk with
+        `drop_repeated_corners`. Without it the raw walk is returned unchanged, which
+        `transports.uvindices_from_qindices` refuses; `grid_section` always passes it.
 
     RETURNS:
     -------
@@ -399,6 +620,10 @@ def create_section_composite(
         (i_c, j_c[, f_c]) correspond to indices of vorticity points that define velocity faces;
         the face index f_c is only returned for multi-tile grids.
         (lons_c, lats_c) are the corresponding longitude and latitudes.
+
+        Without `grid` this is the raw walk: where a section crosses a seam whose corner is
+        stored under two indices, both are still present, and the step between them is not
+        a velocity face.
     """
 
     # A face dimension (3-D corner arrays) marks a multi-tile grid, whose sections
@@ -444,9 +669,15 @@ def create_section_composite(
     lats_c = np.concatenate([lats_c, [lats_c_seg[-1]]], axis=0)
     if multitile:
         f_c = np.concatenate([f_c, [f_c_seg[-1]]], axis=0)
-        return i_c.astype(np.int64), j_c.astype(np.int64), f_c.astype(np.int64), lons_c, lats_c
 
-    return i_c.astype(np.int64), j_c.astype(np.int64), lons_c, lats_c
+    i_c, j_c = i_c.astype(np.int64), j_c.astype(np.int64)
+    f_c = f_c.astype(np.int64) if multitile else None
+    if grid is not None:
+        i_c, j_c, f_c, lons_c, lats_c = drop_repeated_corners(grid, i_c, j_c, f_c)
+    if multitile:
+        return i_c, j_c, f_c, lons_c, lats_c
+
+    return i_c, j_c, lons_c, lats_c
 
 def create_section(gridlon, gridlat, lonstart, latstart, lonend, latend, neighbor_maps, curve="great circle"):
     """

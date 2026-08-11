@@ -56,15 +56,33 @@ def test_periodic_grid_section():
     lonseg = np.array([300, 60])
     latseg = np.array([0, 0])
     i, j, lons, lats = grid_section(grid, lonseg, latseg)
-    # The seam vertex (360 == 0) is symmetric+periodic, so it carries two indices (6 and 0):
-    # the path steps through both, leaving a doubled corner. The zero-length edge between
-    # them carries no flux and is dropped when faces are derived (see uvindices_from_qindices).
+    # The seam vertex (360 == 0) is symmetric+periodic, so it is stored under two indices
+    # (6 and 0). The walk steps through both, but that hand-off spans no grid cell, so only
+    # one of them survives into the section (`drop_repeated_corners` keeps the later one,
+    # index 0 -- the frame the path continues in). The seam vertex therefore appears exactly
+    # once, and every consecutive pair of corners is a real velocity face.
     assert np.all([
-        modequal(i, np.array([5, 6, 0, 1])),
-        modequal(j, np.array([2, 2, 2, 2])),
-        modequal(lons, np.array([300., 360., 0., 60.])),
-        modequal(lats, np.array([0.,   0.,   0., 0.]))
+        modequal(i, np.array([5, 0, 1])),
+        modequal(j, np.array([2, 2, 2])),
+        modequal(lons, np.array([300., 0., 60.])),
+        modequal(lats, np.array([0.,   0., 0.]))
     ])
+
+
+def test_corner_only_grid_still_yields_velocity_faces():
+    """This module's grid declares corner coordinates only -- no cell-center dimensions at
+    all. It can carry no velocity data, but a section traced on it must still enumerate the
+    velocity faces its corners define: the corner->face derivation needs the center
+    dimensions only to wrap a periodic seam crossing back into the centers' range, so it
+    must look them up where it uses them rather than demand them up front."""
+    from sectionate.section import grid_section
+    from sectionate.transports import uvindices_from_qindices
+    i, j, lons, lats = grid_section(grid, np.array([300., 60.]), np.array([0., 0.]))
+    uv = uvindices_from_qindices(grid, i, j)
+    assert uv["var"].size == i.size - 1
+    assert uv["var"].tolist() == ["V", "V"]
+    assert uv["i"].tolist() == [5, 0]        # the two faces flanking the seam vertex
+    assert uv["j"].tolist() == [2, 2]
 
 
 def test_latitude_circle_zero_length_closure():
@@ -97,15 +115,18 @@ def test_latitude_circle_takes_shortest_path_west():
     # Unit level: a raw 270-degree change is a 90-degree westward one; not an error.
     _check_segment_span(0., 0., 270., 0., "latitude circle")
 
-    # End to end: 0 -> 270 leaves lon=0 westward across the periodic seam (the seam
-    # vertex carries both index 6 (lon 360) and index 0 (lon 0)); the endpoint snaps to
-    # the nearest corner at lon=240. The path never visits the eastern half.
+    # End to end: 0 -> 270 leaves lon=0 westward across the periodic seam; the endpoint
+    # snaps to the nearest corner at lon=240. The path never visits the eastern half.
+    # The seam vertex is one physical corner stored under two indices -- 0 (lon 0) and
+    # 6 (lon 360) -- and the walk starts on the first, then hands off to the second to
+    # head west. `drop_repeated_corners` removes the redundant index right after the
+    # walk, so the returned path starts at index 6 rather than carrying both.
     i, j, lons, lats = grid_section(grid, [0., 270.], [0., 0.], curve="latitude circle")
     assert np.all([
-        modequal(i, np.array([0, 6, 5, 4])),
-        modequal(j, np.array([2, 2, 2, 2])),
-        modequal(lons, np.array([0., 360., 300., 240.])),
-        modequal(lats, np.array([0., 0., 0., 0.])),
+        modequal(i, np.array([6, 5, 4])),
+        modequal(j, np.array([2, 2, 2])),
+        modequal(lons, np.array([360., 300., 240.])),
+        modequal(lats, np.array([0., 0., 0.])),
     ])
     assert not np.any(np.isin(np.mod(lons, 360.), [60., 120., 180.]))
 
@@ -254,7 +275,8 @@ def test_parallel_is_held_where_the_geodesic_bows():
     """The test that actually separates the two metrics. Between (0, 40N) and (120, 40N)
     the geodesic bows a long way poleward -- it is the shorter path -- while the parallel
     does not. On a 2-degree grid the constant-latitude walk holds lat 40 for all 61 of its
-    points; the great-circle walk climbs to 60N and takes 83."""
+    points; the great-circle walk climbs to 60N and takes 81 (it crosses the periodic
+    seam diagonally, and `drop_repeated_corners` removes the redundant indices)."""
     from sectionate.section import grid_section
 
     fine = _fine_global_grid()
@@ -266,7 +288,7 @@ def test_parallel_is_held_where_the_geodesic_bows():
 
     i_gc, j_gc, lons_gc, lats_gc = grid_section(fine, [0., 120.], [40., 40.])
     assert lats_gc.max() == 60.                 # bows ~20 degrees poleward
-    assert len(i_gc) == 83
+    assert len(i_gc) == 81
 
     # The combined option classifies this segment as constant-latitude, so it must
     # reproduce the parallel exactly, not the geodesic.

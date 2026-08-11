@@ -142,8 +142,31 @@ def coord_dict(grid):
     dict
         Dictionary containing names of "X" and "Y" dimension variables, at both cell 'center'
         position and the corner position ('outer', 'right', or 'left'; see `corner_position`).
+
+    Raises
+    ------
+    ValueError
+        If either horizontal axis registers no 'center' position. Velocities are staggered
+        onto the center dimensions -- U lives at (X-corner, Y-center) and V at (X-center,
+        Y-corner) -- so a grid without them cannot locate any velocity, and anything that
+        derives faces, transports or tracers from a section needs this mapping.
     """
     corner_pos = corner_position(grid)
+
+    missing = [ax for ax in ("X", "Y") if "center" not in grid.axes[ax].coords]
+    if missing:
+        one = len(missing) == 1
+        raise ValueError(
+            f"The {' and '.join(missing)} {'axis' if one else 'axes'} of this grid "
+            f"{'registers' if one else 'register'} no 'center' position, so sectionate "
+            "cannot locate its velocities: U is stored at (X-corner, Y-center) and V at "
+            "(X-center, Y-corner). Declare the cell-center dimensions, e.g. "
+            "coords={'X': {'center': 'xh', 'outer': 'xq'}, "
+            "'Y': {'center': 'yh', 'outer': 'yq'}}. (A single-tile grid can still be "
+            "traced by `grid_section` from its corner coordinates alone, and its velocity "
+            "faces enumerated; a multi-tile grid cannot, because its corner topology is "
+            "rebuilt from the tracer cells around each corner.)"
+        )
 
     return {
         "X": {
@@ -231,7 +254,10 @@ def build_neighbor_maps(grid, geocorners):
     (shared-corner) corner topology, resolved to native indices -- see
     `_OuterTopology`. Each physical corner appears under a single canonical
     native index (a shared 'outer' seam corner is not stepped through twice),
-    and the returned maps have the same format and native index frame.
+    and the returned maps have the same format and native index frame. That
+    construction reads the tracer cells around each corner, so a multi-tile grid
+    must register a cell-center dimension on both horizontal axes; `coord_dict`
+    raises by name if it does not.
 
     Parameters
     ----------
@@ -253,20 +279,14 @@ def build_neighbor_maps(grid, geocorners):
     multitile = facedim is not None
 
     if multitile:
-        has_centers = all("center" in grid.axes[ax].coords for ax in ("X", "Y"))
-        if has_centers:
-            return outer_topology(grid).maps
-        # Without tracer-center coordinates the cell-identity construction is
-        # unavailable (and neither are velocities, so only walking is needed):
-        # fall back to reading xgcm's corner halos directly. Only shared-corner
-        # ('outer') tilings are safe here -- staggered corner arrays can pad one
-        # corner off across rotated/reversed seams.
-        if corner_position(grid) != "outer":
-            raise ValueError(
-                "Multi-tile grids with staggered ('left'/'right') corners require "
-                "tracer-center coordinates to derive their corner topology."
-            )
-        return _multitile_padded_maps(grid, geocorners)
+        # The cell-fingerprint construction identifies each corner by the tracer cells
+        # around it, so it needs the cell-center *dimensions* (their names and lengths;
+        # no tracer longitude/latitude values are read). There is no substitute: xgcm's
+        # halo padding of corner arrays produces one copy of a shared seam corner per
+        # face -- and, on staggered ('left'/'right') lattices, can land a cross-seam
+        # neighbor one corner off -- so maps read off it would not step through a single
+        # canonical index per physical corner.
+        return outer_topology(grid).maps
     da = geocorners["X"]
     Ydim, Xdim = da.dims[-2], da.dims[-1]
     ny, nx = da.sizes[Ydim], da.sizes[Xdim]
@@ -308,89 +328,6 @@ def build_neighbor_maps(grid, geocorners):
         maps[d] = (None, jmap, imap)
 
     return maps
-
-
-def _multitile_padded_maps(grid, geocorners):
-    """
-    Fallback multi-tile neighbor maps for shared-corner ('outer') tilings that
-    carry no tracer-center coordinates: pad index-valued corner arrays with
-    xgcm's `face_connections` halos and read the neighbors off directly. A
-    shared seam corner is stored on every face that touches it, so these maps
-    step through each face's own copy (seam-twin semantics); `_validate_reciprocity`
-    refuses topologies xgcm's padding cannot represent consistently.
-    """
-    facedim = grid._facedim
-    da = geocorners["X"]
-    Ydim, Xdim = da.dims[-2], da.dims[-1]
-    ny, nx = da.sizes[Ydim], da.sizes[Xdim]
-    nf = da.sizes[facedim]
-    dims = (facedim, Ydim, Xdim)
-    shape = (nf, ny, nx)
-    iarr = xr.DataArray(np.broadcast_to(np.arange(nx), shape).astype(float), dims=dims)
-    jarr = xr.DataArray(np.broadcast_to(np.arange(ny)[:, None], shape).astype(float), dims=dims)
-    farr = xr.DataArray(np.broadcast_to(np.arange(nf)[:, None, None], shape).astype(float), dims=dims)
-    own_f = np.broadcast_to(np.arange(nf)[:, None, None], shape)
-    own_j = np.broadcast_to(np.arange(ny)[:, None], shape)
-    own_i = np.broadcast_to(np.arange(nx), shape)
-
-    axes = _pad_axes(grid, dims)
-    padding = {ax: grid.axes[ax].padding for ax in axes}
-    padding_width = {ax: (1, 1) for ax in axes}
-
-    def pad(a):
-        return _module_pad(a, grid, padding_width, padding=padding, fill_value=np.nan)
-
-    pj, pi, pf = pad(jarr), pad(iarr), pad(farr)
-
-    interior = slice(1, -1)
-    slices = {
-        "right": (interior, slice(2, None)),
-        "left":  (interior, slice(0, -2)),
-        "up":    (slice(2, None), interior),
-        "down":  (slice(0, -2), interior),
-    }
-
-    maps = {}
-    for d, (ysl, xsl) in slices.items():
-        sel = {Ydim: ysl, Xdim: xsl}
-        jmap = pj.isel(sel).values
-        imap = pi.isel(sel).values
-        fmap = pf.isel(sel).values
-        wall = np.isnan(fmap) | np.isnan(jmap) | np.isnan(imap)
-        fmap = np.where(wall, own_f, fmap).astype(np.int64)
-        jmap = np.where(wall, own_j, jmap).astype(np.int64)
-        imap = np.where(wall, own_i, imap).astype(np.int64)
-        maps[d] = (fmap, jmap, imap)
-
-    _validate_reciprocity(maps, own_f, own_j, own_i)
-    return maps
-
-
-def _validate_reciprocity(maps, own_f, own_j, own_i):
-    """
-    Verify that the neighbor maps describe a consistent topology: if B is a
-    (non-wall) neighbor of A, then A must be one of B's four neighbors. An
-    inconsistent map would yield silently-wrong sections, so we detect it and
-    refuse rather than return garbage neighbors.
-    """
-    for d, (fmap, jmap, imap) in maps.items():
-        same = (fmap == own_f) & (jmap == own_j) & (imap == own_i)
-        not_wall = ~same
-        # Gather each neighbor's own four neighbors and look for the point back.
-        reciprocated = np.zeros(jmap.shape, dtype=bool)
-        for (f2, j2, i2) in maps.values():
-            back = (
-                (f2[fmap, jmap, imap] == own_f)
-                & (j2[fmap, jmap, imap] == own_j)
-                & (i2[fmap, jmap, imap] == own_i)
-            )
-            reciprocated |= back
-        if np.any(not_wall & ~reciprocated):
-            raise NotImplementedError(
-                "Could not derive a consistent neighbor topology from this grid's "
-                "`face_connections` metadata (the multi-tile neighbor maps are not "
-                "reciprocal). Sections on grids with simpler topology are supported."
-            )
 
 
 def outer_topology(grid):
@@ -1108,7 +1045,7 @@ class _OuterTopology:
                         node_reps[n].append((f, J, I))
         self.node_reps = node_reps
 
-        # No `_validate_reciprocity` here: the maps project an *undirected* node
+        # The maps need no reciprocity check: they project an *undirected* node
         # graph, so node-level reciprocity holds by construction. Index-level
         # reciprocity deliberately does not: where one physical point is stored
         # natively more than once (e.g. the LLC south-boundary fold, whose rows

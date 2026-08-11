@@ -5,7 +5,7 @@ import dask
 
 from .gridutils import (
     corner_offset, coord_dict, get_geo_corners, get_facedim, build_neighbor_maps,
-    outer_topology, NEIGHBOR_DIRECTIONS,
+    NEIGHBOR_DIRECTIONS,
 )
 from .section import distance_on_unit_sphere, COINCIDENT_TOLERANCE_M
 
@@ -82,16 +82,20 @@ def _left_sign(var, fv, jc, ic, A, B, glon, glat):
 def _uv_for_edge(A, B, neighbor_maps, offset, ranges, glon, glat):
     """
     Velocity face for the directed section edge from corner A=(fA,jA,iA) to B=(fB,jB,iB).
-    Returns (var, i, j, face, Lsign), where Lsign is +1 if the stored velocity's positive
-    direction points left of travel (a geographic sign -- see `_left_sign`); var is "0" for a
-    degenerate edge that carries no flux.
+    Returns (var, i, j, face, Lsign), where var is "U" or "V" and Lsign is +1 if the stored
+    velocity's positive direction points left of travel (a geographic sign -- see `_left_sign`).
 
     The velocity index is read in a single face's frame, so no velocity is rotated across the
     seam: the SOURCE face when the edge's normal velocity lives there (the usual case, and where
     a rotated connection needs no rotation since the edge is a normal X/Y edge on that face);
     otherwise the DESTINATION face (e.g. the trailing edge of a crossing whose normal velocity
-    lives there); otherwise the edge is degenerate (a crossing through a shared boundary corner
-    of an 'outer' tiling). The sign is always geographic, so rotated seams orient correctly.
+    lives there). The sign is always geographic, so rotated seams orient correctly.
+
+    A and B must be distinct physical points: `section.drop_repeated_corners` removes the
+    zero-length hand-off step between a seam corner's two indices when the section is traced,
+    so such a pair never reaches here. If neither face stores the edge's normal velocity, the
+    edge is not a velocity face of this grid and a ValueError is raised rather than a
+    zero-flux placeholder returned, which would silently drop real transport.
     """
     fA, jA, iA = A
     fB, jB, iB = B
@@ -111,8 +115,73 @@ def _uv_for_edge(A, B, neighbor_maps, offset, ranges, glon, glat):
         Lsign = _left_sign(var_d, fB, jB, iB, A, B, glon, glat)
         return var_d, int(vi_d), int(vj_d), int(fB), Lsign
 
-    # 3. degenerate crossing through a shared boundary corner -- carries no flux.
-    return "0", 0, 0, int(fB), 0
+    # 3. Neither face stores this edge's normal velocity.
+    raise ValueError(
+        f"The section edge from corner (face={fA}, j={jA}, i={iA}) to corner "
+        f"(face={fB}, j={jB}, i={iB}) is not a velocity face of this grid: its normal "
+        f"velocity is stored neither on the source face {fA} nor on the destination "
+        f"face {fB}, so no transport can be read across it. This happens where a face "
+        "edge is not backed by any stored velocity (e.g. an unstored cap or grid-cut "
+        "lip). Move the waypoints so the section is routed around that corner."
+    )
+
+
+def _center_size(grid, axis):
+    """
+    Length of `axis`' cell-center dimension, or None if the grid registers no 'center'
+    position on it. A corner-only grid stores no velocities, so it has no cell-center
+    index range to wrap a periodic seam crossing back into -- but it can still be traced,
+    and its corner-to-corner faces still enumerated.
+    """
+    name = grid.axes[axis].coords.get("center")
+    return None if name is None else grid._ds[name].size
+
+
+def _single_tile_face_context(grid):
+    """Grid-derived inputs of `_single_tile_face`: (offset, periodic, centers)."""
+    return (
+        corner_offset(grid),
+        {ax: grid.axes[ax].padding == "periodic" for ax in ("X", "Y")},
+        {ax: _center_size(grid, ax) for ax in ("X", "Y")},
+    )
+
+
+def _single_tile_face(i0, j0, i1, j1, offset, periodic, centers):
+    """
+    Velocity face for the single-tile section edge from corner (i0, j0) to corner (i1, j1),
+    as (var, i, j, Xinc, Yinc). `offset` is the corner->velocity index shift from
+    `gridutils.corner_offset`; `periodic` and `centers` come from
+    `_single_tile_face_context`.
+
+    A step along one axis of more than one index means the section crossed that axis'
+    periodic seam and the path went the short way round, so its direction is the opposite
+    of what the index difference suggests. That reading is only valid on an axis that
+    actually wraps: on a non-periodic axis such a step is a jump between two indices of one
+    physical corner (e.g. the degenerate column where a bipolar cap converges on its pole),
+    and there the index difference already gives the direction. Hence both rules are gated
+    on their own axis' periodicity.
+    """
+    zonal = j1 == j0
+    Xinc = i1 > i0
+    Yinc = j1 > j0
+    if periodic["X"]:
+        if (i1 - i0) > 1: Xinc = False
+        elif (i1 - i0) < -1: Xinc = True
+    if periodic["Y"]:
+        if (j1 - j0) > 1: Yinc = False
+        elif (j1 - j0) < -1: Yinc = True
+
+    var = "V" if zonal else "U"
+    vi = (i1 if (not(Xinc) and zonal) else i0) + (offset if zonal else 0)
+    vj = (j1 if (not(Yinc) and not(zonal)) else j0) + (offset if not(zonal) else 0)
+    # The velocity's along-face index is a cell-center index ("i" for a V face, "j" for a
+    # U face); on a periodic axis a seam crossing can land on the duplicated corner index,
+    # one past the last center, so wrap it back into the centers' range.
+    if zonal and periodic["X"] and centers["X"] is not None:
+        vi = vi % centers["X"]
+    elif not(zonal) and periodic["Y"] and centers["Y"] is not None:
+        vj = vj % centers["Y"]
+    return var, int(vi), int(vj), bool(Xinc), bool(Yinc)
 
 
 def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
@@ -120,6 +189,14 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
     Find the `grid` indices of the N-1 velocity points defined by the consecutive indices of
     N vorticity points, automatically reading the vorticity corner position from `grid`
     metadata ('outer', 'right', or 'left'; see `gridutils.corner_offset`).
+
+    Every consecutive pair of corners must be a real velocity face, i.e. two *distinct*
+    physical points. Sections produced by `grid_section` satisfy this: the zero-length
+    hand-off step between a seam corner's two indices is dropped when the section is traced
+    (see `section.drop_repeated_corners`). This is checked, not assumed -- an index array
+    that repeats a physical corner raises, because deriving a face from that pair would
+    invent one that does not exist. Pass hand-built indices through
+    `section.drop_repeated_corners` first.
 
     PARAMETERS:
     -----------
@@ -155,22 +232,29 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
     glon = np.asarray(geocorners["X"].values)
     glat = np.asarray(geocorners["Y"].values)
 
-    if f_c is not None:
-        # Resolve each corner to its canonical native representation on the
-        # grid's corner topology, dropping consecutive corners that are the
-        # same physical point. Sections saved before multi-tile paths became
-        # twin-free step through both native copies of a shared seam corner:
-        # that zero-length edge is not a velocity face, and the neighbor maps
-        # used below link only canonical representations.
-        ot = outer_topology(grid)
-        f_c = np.asarray(f_c)
-        nodes = ot.node_id[f_c, j_c + ot.t, i_c + ot.t]
-        if (nodes < 0).any():
-            raise ValueError("Section contains indices that are not grid corners.")
-        keep = np.ones(nodes.size, dtype=bool)
-        keep[1:] = nodes[1:] != nodes[:-1]
-        nat = ot.node_native[nodes[keep]]
-        f_c, j_c, i_c = nat[:, 0].copy(), nat[:, 1].copy(), nat[:, 2].copy()
+    # Enforce the section-finding invariant. A pair of corners at the same physical point
+    # spans no grid cell, so it is not a velocity face; the index arithmetic below would
+    # nonetheless produce one (a spurious duplicate of a neighbouring face), so refuse it.
+    if i_c.size > 1:
+        if f_c is not None:
+            fq = np.asarray(f_c)
+            clon, clat = glon[fq, j_c, i_c], glat[fq, j_c, i_c]
+        else:
+            clon, clat = glon[j_c, i_c], glat[j_c, i_c]
+        # Strictly less than, matching `drop_repeated_corners` and the walker exactly: a
+        # pair this check rejects must be a pair normalisation would have removed, or a
+        # section straight from `grid_section` could fail the invariant it establishes.
+        repeated = distance_on_unit_sphere(
+            clon[:-1], clat[:-1], clon[1:], clat[1:]
+        ) < COINCIDENT_TOLERANCE_M
+        if repeated.any():
+            k = int(np.flatnonzero(repeated)[0])
+            raise ValueError(
+                f"Section corners {k} and {k+1} are the same physical point, so they do "
+                "not define a velocity face. Sections from `grid_section` never contain "
+                "such a pair; pass hand-built indices through "
+                "`sectionate.drop_repeated_corners(grid, i_c, j_c, f_c)` first."
+            )
 
     nsec = i_c.size
     uvindices = {
@@ -208,38 +292,23 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
             uvindices["face"][k] = face
             uvindices["Lsign"][k] = Lsign
     else:
+        # A section that crosses a periodic seam takes one step of a whole domain width
+        # (or height): the seam corner's two indices are collapsed to one when the path is
+        # traced (`section.drop_repeated_corners`), so the face on the near side of the
+        # seam is expressed as a wrapped step -- which `_single_tile_face` reads as such,
+        # on periodic axes only.
+        face_context = _single_tile_face_context(grid)
         for k in range(0, nsec-1):
-            zonal = not(j_c[k+1] != j_c[k])
-            Xinc = i_c[k+1] > i_c[k]
-            Yinc = j_c[k+1] > j_c[k]
-            # Handle corner cases for wrapping boundaries
-            if (i_c[k+1] - i_c[k])>1: Xinc = False
-            elif (i_c[k+1] - i_c[k])<-1: Xinc = True
-            uvindex = {
-                "var": "V" if zonal else "U",
-                "i": i_c[k+(1 if not(Xinc) and zonal else 0)],
-                "j": j_c[k+(1 if not(Yinc) and not(zonal) else 0)],
-                "Yinc": Yinc,
-                "Xinc": Xinc,
-            }
-            uvindex["i"] += (offset if zonal else 0)
-            uvindex["j"] += (offset if not(zonal) else 0)
-            for (key, v) in uvindices.items():
-                v[k] = uvindex[key]
+            var, vi, vj, Xinc, Yinc = _single_tile_face(
+                int(i_c[k]), int(j_c[k]), int(i_c[k+1]), int(j_c[k+1]), *face_context
+            )
+            uvindices["var"][k] = var
+            uvindices["i"][k] = vi
+            uvindices["j"][k] = vj
+            uvindices["Xinc"][k] = Xinc
+            uvindices["Yinc"][k] = Yinc
 
-    # Drop zero-length faces. A single physical corner can carry two indices -- at a
-    # periodic seam, a shared multi-tile boundary corner, or the bipolar fold seam -- so
-    # the section path can contain a consecutive pair whose endpoints are the same point.
-    # That edge spans no grid cell and carries no flux, so it is not a velocity face. Both
-    # corners are kept (they anchor the real faces on either side), but the degenerate edge
-    # between them emits no face. Done here, in the deterministic corner->face derivation,
-    # so it applies identically when a saved section is reloaded from its (i_c, j_c[, f_c]).
-    if f_c is not None:
-        clon, clat = glon[f_c, j_c, i_c], glat[f_c, j_c, i_c]
-    else:
-        clon, clat = glon[j_c, i_c], glat[j_c, i_c]
-    keep = distance_on_unit_sphere(clon[:-1], clat[:-1], clon[1:], clat[1:]) > COINCIDENT_TOLERANCE_M
-    return {key: np.asarray(val)[keep] for key, val in uvindices.items()}
+    return uvindices
 
 def uvcoords_from_uvindices(grid, uvindices):
     """
@@ -296,9 +365,10 @@ def uvcoords_from_uvindices(grid, uvindices):
     for p in range(len(uvindices["var"])):
         var, i, j = uvindices["var"][p], uvindices["i"][p], uvindices["j"][p]
         if var not in ("U", "V"):
-            # Degenerate edge (e.g. a seam crossing through a shared corner): no point.
-            lons[p], lats[p] = np.nan, np.nan
-            continue
+            raise ValueError(
+                f"`uvindices['var'][{p}]` is {var!r}; every section face is a 'U' or 'V' "
+                "velocity point."
+            )
         # On multi-tile grids, also select the velocity point's face.
         fsel = {facedim: int(faces[p])} if (facedim is not None and faces is not None) else {}
         if var == "U":
