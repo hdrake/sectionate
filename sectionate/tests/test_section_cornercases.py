@@ -55,9 +55,9 @@ def test_periodic_grid_section():
     lonseg = np.array([300, 60])
     latseg = np.array([0, 0])
     i, j, lons, lats = grid_section(grid, lonseg, latseg)
-    # The seam vertex (360 == 0) is symmetric+periodic, so it carries two indices (6 and 0).
-    # The walk steps through both, but that hand-off spans no grid cell, so only one of the
-    # two identities survives into the section (`drop_repeated_corners` keeps the later one,
+    # The seam vertex (360 == 0) is symmetric+periodic, so it is stored under two indices
+    # (6 and 0). The walk steps through both, but that hand-off spans no grid cell, so only
+    # one of them survives into the section (`drop_repeated_corners` keeps the later one,
     # index 0 -- the frame the path continues in). The seam vertex therefore appears exactly
     # once, and every consecutive pair of corners is a real velocity face.
     assert np.all([
@@ -66,6 +66,22 @@ def test_periodic_grid_section():
         modequal(lons, np.array([300., 0., 60.])),
         modequal(lats, np.array([0.,   0., 0.]))
     ])
+
+
+def test_corner_only_grid_still_yields_velocity_faces():
+    """This module's grid declares corner coordinates only -- no cell-center dimensions at
+    all. It can carry no velocity data, but a section traced on it must still enumerate the
+    velocity faces its corners define: the corner->face derivation needs the center
+    dimensions only to wrap a periodic seam crossing back into the centers' range, so it
+    must look them up where it uses them rather than demand them up front."""
+    from sectionate.section import grid_section
+    from sectionate.transports import uvindices_from_qindices
+    i, j, lons, lats = grid_section(grid, np.array([300., 60.]), np.array([0., 0.]))
+    uv = uvindices_from_qindices(grid, i, j)
+    assert uv["var"].size == i.size - 1
+    assert uv["var"].tolist() == ["V", "V"]
+    assert uv["i"].tolist() == [5, 0]        # the two faces flanking the seam vertex
+    assert uv["j"].tolist() == [2, 2]
 
 
 def test_latitude_circle_zero_length_closure():

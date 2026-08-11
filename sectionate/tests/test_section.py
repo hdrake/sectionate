@@ -188,7 +188,7 @@ def _symmetric_periodic_grid(N=8):
 def test_zero_length_seam_corner_dropped_by_section_finding():
     """On a symmetric periodic grid the seam vertex (360 == 0) carries two indices, and the
     walk steps through both. That pair spans no grid cell, so it is not a velocity face:
-    `grid_section` drops the redundant identity, so the section it returns never contains a
+    `grid_section` drops the redundant index, so the section it returns never contains a
     consecutive pair of corners at the same physical point, and every consecutive pair
     becomes a face. The faces are the same ones the walk implied, in both directions."""
     from sectionate.section import grid_section, distance_on_unit_sphere
@@ -223,7 +223,7 @@ def test_zero_length_seam_corner_dropped_by_section_finding():
 def test_repeated_corner_raises_rather_than_inventing_a_face():
     """`uvindices_from_qindices` requires the section-finding invariant instead of
     re-establishing it, so it must CHECK rather than assume: a hand-built path that steps
-    through both identities of the seam vertex has to raise. Silently deriving a face from
+    through both of the seam vertex's indices has to raise. Silently deriving a face from
     that pair would invent a duplicate of a neighbouring face and double-count its flux."""
     from sectionate.section import grid_section, drop_repeated_corners
     from sectionate.transports import uvindices_from_qindices
@@ -232,7 +232,7 @@ def test_repeated_corner_raises_rather_than_inventing_a_face():
     i_c, j_c, _, _ = grid_section(g, [315., 45.], [0., 0.])
     assert i_c.tolist() == [7, 0, 1]
 
-    # the raw walk, stepping through both identities of the seam vertex (360 == 0)
+    # the raw walk, stepping through both indices of the seam vertex (360 == 0)
     bad_i, bad_j = [7, 8, 0, 1], [1, 1, 1, 1]
     with pytest.raises(ValueError, match="same physical point"):
         uvindices_from_qindices(g, bad_i, bad_j)
@@ -242,6 +242,136 @@ def test_repeated_corner_raises_rather_than_inventing_a_face():
     assert fixed_f is None
     assert fixed_i.tolist() == i_c.tolist()
     assert fixed_j.tolist() == j_c.tolist()
+
+
+def test_create_section_composite_normalises_when_given_a_grid():
+    """`create_section_composite` is public and documented as the lower-level entry point,
+    so what it returns must be usable by the rest of the public API. Given the grid it
+    normalises exactly as `grid_section` does; without one the caller still gets the raw
+    walk, which `uvindices_from_qindices` refuses."""
+    from sectionate.section import create_section_composite, grid_section
+    from sectionate.gridutils import get_geo_corners, build_neighbor_maps
+    from sectionate.transports import uvindices_from_qindices
+
+    g = _symmetric_periodic_grid()
+    geocorners = get_geo_corners(g)
+    maps = build_neighbor_maps(g, geocorners)
+    args = (geocorners["X"], geocorners["Y"], [315., 45.], [0., 0.])
+
+    raw_i, raw_j, _, _ = create_section_composite(*args, neighbor_maps=maps)
+    assert raw_i.tolist() == [7, 8, 0, 1]            # the seam vertex under both indices
+    with pytest.raises(ValueError, match="same physical point"):
+        uvindices_from_qindices(g, raw_i, raw_j)
+
+    i_c, j_c, _, _ = create_section_composite(*args, neighbor_maps=maps, grid=g)
+    assert i_c.tolist() == grid_section(g, [315., 45.], [0., 0.])[0].tolist()
+    assert uvindices_from_qindices(g, i_c, j_c)["var"].size == i_c.size - 1
+
+
+def _idealized_grid(xpad, ypad, N=8):
+    """A symmetric ('outer') grid whose two axes can each be declared periodic or walled,
+    for exercising the seam-crossing index arithmetic on either topology."""
+    xq = np.linspace(0., 360., N + 1); xh = 0.5 * (xq[:-1] + xq[1:])
+    yq = np.linspace(-40., 40., N + 1); yh = 0.5 * (yq[:-1] + yq[1:])
+    lon_c, lat_c = np.meshgrid(xq, yq); lon2, lat2 = np.meshgrid(xh, yh)
+    return xgcm.Grid(
+        xr.Dataset(coords={
+            "xq": np.arange(N + 1), "yq": np.arange(N + 1),
+            "xh": np.arange(N), "yh": np.arange(N),
+            "geolon_c": (("yq", "xq"), lon_c), "geolat_c": (("yq", "xq"), lat_c),
+            "geolon": (("yh", "xh"), lon2), "geolat": (("yh", "xh"), lat2),
+        }),
+        coords={"X": {"center": "xh", "outer": "xq"}, "Y": {"center": "yh", "outer": "yq"}},
+        padding={"X": xpad, "Y": ypad}, autoparse_metadata=False,
+    )
+
+
+def test_wrap_rule_applies_only_to_periodic_axes():
+    """A step of more than one index along an axis means the section crossed that axis'
+    seam and went the short way round -- so its direction is the opposite of what the index
+    difference says, and the face is the one on the near side of the seam. That reading is
+    only valid on an axis that WRAPS. On a walled axis the same step is a jump between two
+    indices of one physical corner (the degenerate column of a bipolar cap), and reading it
+    as a wrap puts the face on the wrong side and its cell index out of range. Each rule is
+    therefore gated on its own axis' periodicity."""
+    from sectionate.transports import uvindices_from_qindices
+
+    periodic = _idealized_grid("periodic", "periodic")
+    walled = _idealized_grid("extend", "extend")
+
+    # A zonal step of -7: eastward across the "X" seam if it wraps, else a jump west.
+    uv = uvindices_from_qindices(periodic, [7, 0], [1, 1])
+    assert (uv["var"][0], uv["i"][0], bool(uv["Xinc"][0])) == ("V", 7, True)
+    uv = uvindices_from_qindices(walled, [7, 0], [1, 1])
+    assert (uv["var"][0], uv["i"][0], bool(uv["Xinc"][0])) == ("V", 0, False)
+
+    # ...and the same, one axis over: a meridional step of -7 across the "Y" seam.
+    uv = uvindices_from_qindices(periodic, [1, 1], [7, 0])
+    assert (uv["var"][0], uv["j"][0], bool(uv["Yinc"][0])) == ("U", 7, True)
+    uv = uvindices_from_qindices(walled, [1, 1], [7, 0])
+    assert (uv["var"][0], uv["j"][0], bool(uv["Yinc"][0])) == ("U", 0, False)
+
+
+def _pole_column_grid(N=6, M=4, jp=2):
+    """A miniature bipolar cap: an X-periodic symmetric grid whose corner column `i=0`
+    (and its seam twin `i=N`) collapses to a single physical point from row `jp` up, the
+    way a bipolar cap's grid column converges on its pole. Rows `jp..M` of that column are
+    one corner stored 2*(M-jp+1) times."""
+    xq = np.linspace(0., 360., N + 1); xh = 0.5 * (xq[:-1] + xq[1:])
+    yq = np.linspace(-30., 30., M + 1); yh = 0.5 * (yq[:-1] + yq[1:])
+    lon_c, lat_c = np.meshgrid(xq, yq); lon2, lat2 = np.meshgrid(xh, yh)
+    for i in (0, N):
+        lon_c[jp:, i] = lon_c[jp, 0]
+        lat_c[jp:, i] = lat_c[jp, 0]
+    return xgcm.Grid(
+        xr.Dataset(coords={
+            "xq": np.arange(N + 1), "yq": np.arange(M + 1),
+            "xh": np.arange(N), "yh": np.arange(M),
+            "geolon_c": (("yq", "xq"), lon_c), "geolat_c": (("yq", "xq"), lat_c),
+            "geolon": (("yh", "xh"), lon2), "geolat": (("yh", "xh"), lat2),
+        }),
+        coords={"X": {"center": "xh", "outer": "xq"}, "Y": {"center": "yh", "outer": "yq"}},
+        padding={"X": "periodic", "Y": "extend"}, autoparse_metadata=False,
+    )
+
+
+def test_degenerate_column_collapses_to_the_index_that_names_both_faces():
+    """A path that walks up a degenerate column and turns off it enters and leaves the pole
+    on the SAME index, so one index stands in for the whole run: the collapsed path must
+    yield exactly the two faces the raw path did. Which index survives is not free -- it is
+    the one that reproduces them."""
+    from sectionate.section import drop_repeated_corners
+    from sectionate.transports import uvindices_from_qindices
+
+    g = _pole_column_grid()
+    raw_i, raw_j = [6, 6, 6, 6, 5], [1, 2, 3, 4, 4]
+    raw_faces = [("U", 6, 1), ("V", 5, 4)]      # the only two real faces of that path
+
+    i_c, j_c, f_c, lons_c, lats_c = drop_repeated_corners(g, raw_i, raw_j)
+    assert f_c is None
+    assert i_c.tolist() == [6, 6, 5] and j_c.tolist() == [1, 4, 4]
+
+    uv = uvindices_from_qindices(g, i_c, j_c)
+    assert uv["var"].size == i_c.size - 1
+    assert list(zip(uv["var"], uv["i"].tolist(), uv["j"].tolist())) == raw_faces
+
+
+def test_degenerate_column_entered_and_left_on_different_indices_raises():
+    """The pole of a bipolar cap is one physical corner stored under a whole column of
+    indices. A section can reach it along one of them and leave along another, far apart in
+    the index lattice; then no single index is adjacent to both neighbours, so no path with
+    distinct consecutive corners carries both flanking faces. That must raise and name the
+    corner, not silently emit a face the section does not have (collapsing to the last
+    index here would turn the leading V face into a U face)."""
+    from sectionate.section import drop_repeated_corners
+
+    g = _pole_column_grid()
+    # In along row 4 (a V face), out along row 2 (another V face), via the pole.
+    raw_i, raw_j = [1, 0, 0, 0, 6, 5], [4, 4, 3, 2, 2, 2]
+    with pytest.raises(ValueError, match="degenerate"):
+        drop_repeated_corners(g, raw_i, raw_j)
+    with pytest.raises(ValueError, match=r"enters it from \(1, 4\)"):
+        drop_repeated_corners(g, raw_i, raw_j)
 
 
 def test_gridded_section_roundtrips_through_save_load(tmp_path):

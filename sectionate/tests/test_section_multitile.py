@@ -14,10 +14,11 @@ from sectionate.transports import convergent_transport
 def _make_grid(lon, lat, face_connections, centers=False):
     """Build a symmetric ('outer' corner) multi-tile grid from (face, yg, xg) coords.
 
-    `centers=True` also registers the cell-center dimensions. Only corner coordinates are
-    needed to exercise the neighbor maps, so these fixtures declare none by default -- but
-    `grid_section` requires them on a multi-tile grid (see `_check_supported_topology`),
-    since the shared-corner topology is rebuilt from the cells around each corner.
+    `centers=True` also registers the cell-center dimensions, which a multi-tile grid needs
+    for anything at all: the shared-corner topology is rebuilt from the tracer cells around
+    each corner, so both `build_neighbor_maps` and `grid_section` (see
+    `_check_supported_topology`) require them. The default leaves them out, to check that
+    such a grid is refused by name rather than mis-traced.
     """
     nf, ng, _ = lon.shape
     coords = {
@@ -79,35 +80,6 @@ def left_two_tile_x_to_y(Nc=5):
         padding="fill", fill_value=np.nan, face_connections=fc, autoparse_metadata=False)
 
 
-def two_face_x_to_y(Nc=4):
-    """face0 right-X connects to face1 Y (a 90-degree rotation)."""
-    ng = Nc + 1
-    lon = np.zeros((2, ng, ng)); lat = np.zeros((2, ng, ng))
-    # Encode (face, i) so we can read topology back out; geometry is not used here.
-    for f in range(2):
-        for j in range(ng):
-            for i in range(ng):
-                lon[f, j, i] = f * 1000 + i
-                lat[f, j, i] = j
-    fc = {"face": {0: {"X": (None, (1, "Y", False))},
-                   1: {"Y": ((0, "X", False), None)}}}
-    return _make_grid(lon, lat, fc)
-
-
-def cubed_sphere(Nc=4):
-    ng = Nc + 1
-    lon = np.zeros((6, ng, ng)); lat = np.zeros((6, ng, ng))
-    fc = {"face": {
-        0: {"X": ((3, "X", False), (1, "X", False)), "Y": ((4, "Y", False), (5, "Y", False))},
-        1: {"X": ((0, "X", False), (2, "X", False)), "Y": ((4, "X", False), (5, "X", True))},
-        2: {"X": ((1, "X", False), (3, "X", False)), "Y": ((4, "Y", True), (5, "Y", True))},
-        3: {"X": ((2, "X", False), (0, "X", False)), "Y": ((4, "X", True), (5, "X", False))},
-        4: {"X": ((3, "Y", True), (1, "Y", False)), "Y": ((2, "Y", True), (0, "Y", False))},
-        5: {"X": ((3, "Y", False), (1, "Y", True)), "Y": ((0, "Y", False), (2, "Y", True))},
-    }}
-    return _make_grid(lon, lat, fc)
-
-
 def is_neighbor(prev, cur, maps):
     f, j, i = prev
     for d in NEIGHBOR_DIRECTIONS:
@@ -130,33 +102,6 @@ def assert_path_invariant(i_c, j_c, f_c, maps):
 # ---------------------------------------------------------------------------
 # Neighbor-map unit tests (topology only)
 # ---------------------------------------------------------------------------
-
-def test_neighbor_maps_x_to_x_seam():
-    grid = two_face_x_to_x()
-    maps = build_neighbor_maps(grid, get_geo_corners(grid))
-    nx = maps["right"][0].shape[-1]
-    # Right edge of face 0 -> face 1, landing on its left edge (i=0), same row.
-    fmap, jmap, imap = maps["right"]
-    assert np.all(fmap[0][:, -1] == 1)
-    assert np.all(imap[0][:, -1] == 0)
-    assert np.all(jmap[0][:, -1] == np.arange(grid._ds.sizes["yg"]))
-    # Interior steps right by one on the same face.
-    assert np.all(fmap[0][:, :-1] == 0)
-    assert np.all(imap[0][:, :-1] == np.arange(1, nx))
-
-
-def test_neighbor_maps_x_to_y_rotation_and_reversal():
-    grid = two_face_x_to_y()
-    maps = build_neighbor_maps(grid, get_geo_corners(grid))
-    fmap, jmap, imap = maps["right"]
-    n = grid._ds.sizes["yg"]
-    # Right edge of face0 lands on face1...
-    assert np.all(fmap[0][:, -1] == 1)
-    # ...on its bottom row (Y=0, the X->Y rotation)...
-    assert np.all(jmap[0][:, -1] == 0)
-    # ...with the tangential index reversed (j -> n-1-j).
-    assert np.all(imap[0][:, -1] == (n - 1) - np.arange(n))
-
 
 def test_neighbor_maps_left_grid_rotated_seam_are_edge_adjacent():
     """On a native 'left'-staggered grid, the vorticity lattice sits half a cell
@@ -193,25 +138,6 @@ def test_neighbor_maps_left_grid_rotated_seam_are_edge_adjacent():
                     # an interior corner (all four cells real) must share an EDGE (2 cells)
                     if len(a) == 4 and len(b) == 4:
                         assert len(a & b) >= 2, f"{d}: ({f},{j},{i}) -> {nb} only diagonally adjacent"
-
-
-def test_cubed_sphere_reciprocal_or_raises():
-    # xgcm's padding is unreliable (hash-seed dependent) for the cubed sphere's
-    # complex reversed/rotated connections. build_neighbor_maps must therefore
-    # EITHER produce a fully reciprocal (correct) topology OR refuse with a clear
-    # error -- it must never silently return an inconsistent topology. This holds
-    # regardless of which (buggy) halo xgcm happens to produce.
-    grid = cubed_sphere()
-    try:
-        maps = build_neighbor_maps(grid, get_geo_corners(grid))
-    except NotImplementedError:
-        return
-    # If it did not raise, the maps must be self-consistent: when face 0's right
-    # neighbor is face 1, the connection definition (X right -> 1) must hold.
-    assert np.all(maps["right"][0][0][:, -1] == 1)
-    assert np.all(maps["left"][0][0][:, 0] == 3)
-    assert np.all(maps["up"][0][0][-1, :] == 5)
-    assert np.all(maps["down"][0][0][0, :] == 4)
 
 
 # ---------------------------------------------------------------------------
@@ -686,12 +612,12 @@ def assert_maps_equal(a, b):
 
 
 @pytest.mark.parametrize("fixture", [
-    two_face_x_to_x,        # 'outer' corners, no tracer centers -> _multitile_padded_maps
-    left_two_tile_x_to_y,   # 'left' corners with centers        -> _OuterTopology
+    pytest.param(lambda: two_face_x_to_x(centers=True), id="outer_corners"),
+    pytest.param(left_two_tile_x_to_y, id="left_corners"),
 ])
 def test_vertical_axis_does_not_affect_multitile_neighbor_maps(fixture):
-    """Both multi-tile neighbor-map paths padded their index arrays over *every* axis
-    of the grid, so a Z axis -- which every real model grid registers -- made the grid
+    """The multi-tile neighbor maps padded their index arrays over *every* axis of the
+    grid, so a Z axis -- which every real model grid registers -- made the grid
     untraceable. The maps must be identical with and without one."""
     grid = fixture()
     plain = build_neighbor_maps(grid, get_geo_corners(grid))

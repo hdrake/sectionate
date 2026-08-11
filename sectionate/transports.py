@@ -92,10 +92,10 @@ def _uv_for_edge(A, B, neighbor_maps, offset, ranges, glon, glat):
     lives there). The sign is always geographic, so rotated seams orient correctly.
 
     A and B must be distinct physical points: `section.drop_repeated_corners` removes the
-    zero-length hand-off step between the two identities of a seam corner when the section is
-    traced, so such a pair never reaches here. If neither face stores the edge's normal
-    velocity, the edge is not a velocity face of this grid and a ValueError is raised rather
-    than a zero-flux placeholder returned, which would silently drop real transport.
+    zero-length hand-off step between a seam corner's two indices when the section is traced,
+    so such a pair never reaches here. If neither face stores the edge's normal velocity, the
+    edge is not a velocity face of this grid and a ValueError is raised rather than a
+    zero-flux placeholder returned, which would silently drop real transport.
     """
     fA, jA, iA = A
     fB, jB, iB = B
@@ -117,9 +117,71 @@ def _uv_for_edge(A, B, neighbor_maps, offset, ranges, glon, glat):
 
     # 3. Neither face stores this edge's normal velocity.
     raise ValueError(
-        f"Section edge {A} -> {B} is not a velocity face of this grid: its normal "
-        "velocity is stored on neither the source nor the destination face."
+        f"The section edge from corner (face={fA}, j={jA}, i={iA}) to corner "
+        f"(face={fB}, j={jB}, i={iB}) is not a velocity face of this grid: its normal "
+        f"velocity is stored neither on the source face {fA} nor on the destination "
+        f"face {fB}, so no transport can be read across it. This happens where a face "
+        "edge is not backed by any stored velocity (e.g. an unstored cap or grid-cut "
+        "lip). Move the waypoints so the section is routed around that corner."
     )
+
+
+def _center_size(grid, axis):
+    """
+    Length of `axis`' cell-center dimension, or None if the grid registers no 'center'
+    position on it. A corner-only grid stores no velocities, so it has no cell-center
+    index range to wrap a periodic seam crossing back into -- but it can still be traced,
+    and its corner-to-corner faces still enumerated.
+    """
+    name = grid.axes[axis].coords.get("center")
+    return None if name is None else grid._ds[name].size
+
+
+def _single_tile_face_context(grid):
+    """Grid-derived inputs of `_single_tile_face`: (offset, periodic, centers)."""
+    return (
+        corner_offset(grid),
+        {ax: grid.axes[ax].padding == "periodic" for ax in ("X", "Y")},
+        {ax: _center_size(grid, ax) for ax in ("X", "Y")},
+    )
+
+
+def _single_tile_face(i0, j0, i1, j1, offset, periodic, centers):
+    """
+    Velocity face for the single-tile section edge from corner (i0, j0) to corner (i1, j1),
+    as (var, i, j, Xinc, Yinc). `offset` is the corner->velocity index shift from
+    `gridutils.corner_offset`; `periodic` and `centers` come from
+    `_single_tile_face_context`.
+
+    A step along one axis of more than one index means the section crossed that axis'
+    periodic seam and the path went the short way round, so its direction is the opposite
+    of what the index difference suggests. That reading is only valid on an axis that
+    actually wraps: on a non-periodic axis such a step is a jump between two indices of one
+    physical corner (e.g. the degenerate column where a bipolar cap converges on its pole),
+    and there the index difference already gives the direction. Hence both rules are gated
+    on their own axis' periodicity.
+    """
+    zonal = j1 == j0
+    Xinc = i1 > i0
+    Yinc = j1 > j0
+    if periodic["X"]:
+        if (i1 - i0) > 1: Xinc = False
+        elif (i1 - i0) < -1: Xinc = True
+    if periodic["Y"]:
+        if (j1 - j0) > 1: Yinc = False
+        elif (j1 - j0) < -1: Yinc = True
+
+    var = "V" if zonal else "U"
+    vi = (i1 if (not(Xinc) and zonal) else i0) + (offset if zonal else 0)
+    vj = (j1 if (not(Yinc) and not(zonal)) else j0) + (offset if not(zonal) else 0)
+    # The velocity's along-face index is a cell-center index ("i" for a V face, "j" for a
+    # U face); on a periodic axis a seam crossing can land on the duplicated corner index,
+    # one past the last center, so wrap it back into the centers' range.
+    if zonal and periodic["X"] and centers["X"] is not None:
+        vi = vi % centers["X"]
+    elif not(zonal) and periodic["Y"] and centers["Y"] is not None:
+        vj = vj % centers["Y"]
+    return var, int(vi), int(vj), bool(Xinc), bool(Yinc)
 
 
 def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
@@ -130,10 +192,10 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
 
     Every consecutive pair of corners must be a real velocity face, i.e. two *distinct*
     physical points. Sections produced by `grid_section` satisfy this: the zero-length
-    hand-off step between the two identities of a seam corner is dropped when the section
-    is traced (see `section.drop_repeated_corners`). This is checked, not assumed -- an
-    index array that repeats a physical corner raises, because deriving a face from that
-    pair would invent one that does not exist. Pass hand-built indices through
+    hand-off step between a seam corner's two indices is dropped when the section is traced
+    (see `section.drop_repeated_corners`). This is checked, not assumed -- an index array
+    that repeats a physical corner raises, because deriving a face from that pair would
+    invent one that does not exist. Pass hand-built indices through
     `section.drop_repeated_corners` first.
 
     PARAMETERS:
@@ -231,45 +293,20 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
             uvindices["Lsign"][k] = Lsign
     else:
         # A section that crosses a periodic seam takes one step of a whole domain width
-        # (or height): the seam's two corner identities are collapsed to one when the
-        # path is traced (`section.drop_repeated_corners`), so the face on the near side
-        # of the seam is expressed as a wrapped step. The sign of that step is the
-        # opposite of what its index difference suggests, and the cell index it lands on
-        # is the far identity of a duplicated seam column/row, so it is wrapped back into
-        # the range of the centers below.
-        coords = coord_dict(grid)
-        centers = {
-            "X": grid._ds[coords["X"]["center"]].size,
-            "Y": grid._ds[coords["Y"]["center"]].size,
-        }
-        periodic = {ax: grid.axes[ax].padding == "periodic" for ax in ("X", "Y")}
+        # (or height): the seam corner's two indices are collapsed to one when the path is
+        # traced (`section.drop_repeated_corners`), so the face on the near side of the
+        # seam is expressed as a wrapped step -- which `_single_tile_face` reads as such,
+        # on periodic axes only.
+        face_context = _single_tile_face_context(grid)
         for k in range(0, nsec-1):
-            zonal = not(j_c[k+1] != j_c[k])
-            Xinc = i_c[k+1] > i_c[k]
-            Yinc = j_c[k+1] > j_c[k]
-            # Handle corner cases for wrapping boundaries
-            if (i_c[k+1] - i_c[k])>1: Xinc = False
-            elif (i_c[k+1] - i_c[k])<-1: Xinc = True
-            if (j_c[k+1] - j_c[k])>1: Yinc = False
-            elif (j_c[k+1] - j_c[k])<-1: Yinc = True
-            uvindex = {
-                "var": "V" if zonal else "U",
-                "i": i_c[k+(1 if not(Xinc) and zonal else 0)],
-                "j": j_c[k+(1 if not(Yinc) and not(zonal) else 0)],
-                "Yinc": Yinc,
-                "Xinc": Xinc,
-            }
-            uvindex["i"] += (offset if zonal else 0)
-            uvindex["j"] += (offset if not(zonal) else 0)
-            # The velocity's along-face index is a cell-center index ("i" for a V face,
-            # "j" for a U face); on a periodic axis a seam crossing can land on the
-            # duplicated corner identity, one past the last center.
-            if zonal and periodic["X"]:
-                uvindex["i"] = uvindex["i"] % centers["X"]
-            elif not(zonal) and periodic["Y"]:
-                uvindex["j"] = uvindex["j"] % centers["Y"]
-            for (key, v) in uvindices.items():
-                v[k] = uvindex[key]
+            var, vi, vj, Xinc, Yinc = _single_tile_face(
+                int(i_c[k]), int(j_c[k]), int(i_c[k+1]), int(j_c[k+1]), *face_context
+            )
+            uvindices["var"][k] = var
+            uvindices["i"][k] = vi
+            uvindices["j"][k] = vj
+            uvindices["Xinc"][k] = Xinc
+            uvindices["Yinc"][k] = Yinc
 
     return uvindices
 
