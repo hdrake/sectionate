@@ -239,6 +239,16 @@ staggering (`outer`, `right` or `left`) and is read from the grid rather than as
 "Up to" `N-1`, because a consecutive pair that resolves to the same physical point — the twin
 corners of a seam again — spans no cell and carries no flux, so it emits no face at all.
 
+Twins matter here for a second reason. Naming the face between two corners assumes they are
+neighbours *in index space*, and across a bipolar fold that can fail: the walk may leave one
+index representation of a seam corner and land next to the *other*, a real physical edge whose
+endpoints are far apart in `i`. Attributing that step from the source corner alone would name
+the mirrored column's face, with the sign that goes with it. So before converting the chain,
+`uvindices_from_qindices` resolves corner identity — multi-tile grids canonicalise every corner
+through the outer-lattice topology, single-tile grids splice the skipped twin back into the
+chain — after which every remaining step is an ordinary adjacent one, and the zero-length twin
+edge it introduces drops out by the rule above rather than being counted twice.
+
 `transports.convergent_transport` then accumulates the signed normal transport through those
 faces. For a **closed** section it works out the traversal orientation and signs everything so
 that positive means *into* the enclosed region; for an **open** section there is no inside, so
