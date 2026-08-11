@@ -38,7 +38,8 @@ def extract_tracer(
     RETURNS:
     --------
 
-    xarray.DataArray with data interpolated to the U and V points along the section.
+    xarray.DataArray with data interpolated to the U and V points along the section,
+    carrying a "q" coordinate giving the step of (i_c, j_c) each point came from.
     """
     
     da=grid._ds[name]
@@ -78,5 +79,12 @@ def extract_tracer(
     tracer = tracer.where(tracer!=0., np.nan)
     tracer.name = da.name
     tracer.attrs = da.attrs
+
+    # Same "q" as `convergent_transport`: the step of the caller's corner arrays each face
+    # came from, so a tracer section and a transport section stay relatable to the corners
+    # even though faces and corner steps are not one-to-one.
+    tracer = tracer.assign_coords({
+        "q": xr.DataArray(uvindices["q"], dims=sect_coord)
+    })
 
     return tracer

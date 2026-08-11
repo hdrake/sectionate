@@ -226,7 +226,8 @@ from sectionate.transports import uvindices_from_qindices
 
 uv = uvindices_from_qindices(grid, i_c, j_c)
 # uv["var"] is "U" or "V" per face; uv["i"], uv["j"] index that velocity;
-# uv["Xinc"], uv["Yinc"] record the direction of travel through each face.
+# uv["Xinc"], uv["Yinc"] record the direction of travel through each face;
+# uv["q"] says which step of (i_c, j_c) each face came from.
 ```
 
 Whether a face is a `U` or a `V` point falls straight out of which way the step went, though
@@ -238,6 +239,29 @@ staggering (`outer`, `right` or `left`) and is read from the grid rather than as
 
 "Up to" `N-1`, because a consecutive pair that resolves to the same physical point — the twin
 corners of a seam again — spans no cell and carries no flux, so it emits no face at all.
+
+Twins matter here for a second reason. Naming the face between two corners assumes they are
+neighbours *in index space*, and across a bipolar fold that can fail: the walk may leave one
+index representation of a seam corner and land next to the *other*, a real physical edge whose
+endpoints are far apart in `i`. Attributing that step from the source corner alone would name
+the mirrored column's face, with the sign that goes with it. So before converting the chain,
+`uvindices_from_qindices` resolves corner identity — multi-tile grids canonicalise every corner
+through the outer-lattice topology, single-tile grids splice the skipped twin back into the
+chain — after which every remaining step is an ordinary adjacent one, and the zero-length twin
+edge it introduces drops out by the rule above rather than being counted twice.
+
+Which representation the chain arrives in does not matter. A section may already carry both
+indices of a seam corner — that is what the walk returns across a periodic wrap, and what a
+boundary traced on a cell mask returns at every seam junction — or only one, which is what it
+returns across a fold. Either way the faces come out the same, because coincidence is tested
+before adjacency: a pair that is *already* the zero-length twin edge is passed straight to the
+drop rather than being mistaken for a step needing repair.
+
+The consequence is that faces and corner steps are not one-to-one, so `uv["q"]` says which is
+which: face `k` spans corners `q[k]` and `q[k]+1`, and the steps `q` skips are exactly the ones
+that carried no flux. It rides along on `convergent_transport` and `extract_tracer` output, so
+a transport can be put back onto the section's corners — to plot it against them, to slice out
+the part belonging to one stretch of the path, or to find a child section inside its parent.
 
 `transports.convergent_transport` then accumulates the signed normal transport through those
 faces. For a **closed** section it works out the traversal orientation and signs everything so
