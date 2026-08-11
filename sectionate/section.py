@@ -476,8 +476,11 @@ def _collapse_single_tile_runs(grid, i_c, j_c, repeated):
                     f"{(int(i_c[before]), int(j_c[before]))} and leaves it towards "
                     f"{(int(i_c[after]), int(j_c[after]))}, and no single index of that "
                     "corner is adjacent to both, so no section with distinct consecutive "
-                    "corners can carry both of the velocity faces on either side. Route "
-                    "the section around the pole instead of through it."
+                    "corners can carry both of the velocity faces on either side. If this "
+                    "grid has a bipolar/tripolar fold, declare it -- "
+                    "padding={'Y': {'fold': 'corner'}} -- so the walk crosses the cap "
+                    "through the fold seam rather than through the pole column; that is "
+                    "what this arises from. Otherwise route the section around the pole."
                 )
             keep[start:end + 1] = False
             keep[chosen] = True
