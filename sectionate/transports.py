@@ -175,9 +175,27 @@ def _insert_seam_twins(i_c, j_c, glon, glat, grid):
 
     Runs on every single-tile grid and is a no-op unless a step actually skips the twin, so
     grids without seam duplicates (and fold sections that never cross the seam) are untouched.
+
+    A pair that is *already* the two indices of one physical corner needs no splicing: it is
+    the zero-length twin edge this function otherwise creates, so it is passed straight through
+    to the drop. That case has to be recognised before index adjacency is tested, because the
+    two indices of a seam corner are in general far apart in the index lattice -- a bipolar
+    fold seam identifies column i with column nx-i. Sections traced on a cell mask arrive in
+    exactly this form (`regionate.boundaries` keeps both coincident corners at a seam
+    junction), as do sections reloaded from saved indices.
+
+    RETURNS:
+    --------
+    i_c, j_c: np.ndarray
+        The corner chain with seam twins spliced in.
+    src: np.ndarray of int
+        For each returned corner, the index into the *input* arrays that it came from. A
+        spliced twin is attributed to the corner it was derived from, i.e. to the input step
+        it belongs to, so that the velocity face between returned corners m and m+1 belongs to
+        input step `src[m]`. This is what `uvindices_from_qindices` reports as "q".
     """
     if len(i_c) < 2:
-        return np.asarray(i_c), np.asarray(j_c)
+        return np.asarray(i_c), np.asarray(j_c), np.arange(len(i_c))
     ny, nx = glon.shape
     y_periodic, x_periodic = _axis_periodic(grid, "Y"), _axis_periodic(grid, "X")
 
@@ -186,11 +204,13 @@ def _insert_seam_twins(i_c, j_c, glon, glat, grid):
             glon[ja, ia], glat[ja, ia], glon[jb, ib], glat[jb, ib]
         ) < COINCIDENT_TOLERANCE_M
 
-    out_i, out_j = [int(i_c[0])], [int(j_c[0])]
+    out_i, out_j, src = [int(i_c[0])], [int(j_c[0])], [0]
     for k in range(len(i_c) - 1):
         ja, ia = int(j_c[k]), int(i_c[k])
         jb, ib = int(j_c[k + 1]), int(i_c[k + 1])
-        if not _index_adjacent(ja, ia, jb, ib, ny, nx, y_periodic, x_periodic):
+        if coincident(ja, ia, jb, ib):
+            pass  # already a zero-length twin edge; emits no velocity face
+        elif not _index_adjacent(ja, ia, jb, ib, ny, nx, y_periodic, x_periodic):
             # Either a twin of A adjacent to B, or a twin of B adjacent to A, turns the
             # step into two index-adjacent ones. Which of the two exists depends on
             # whether the section is entering or leaving the seam.
@@ -216,10 +236,12 @@ def _insert_seam_twins(i_c, j_c, glon, glat, grid):
                 )
             out_j.append(twin[0])
             out_i.append(twin[1])
+            src.append(k)
         out_j.append(jb)
         out_i.append(ib)
+        src.append(k + 1)
 
-    return np.asarray(out_i), np.asarray(out_j)
+    return np.asarray(out_i), np.asarray(out_j), np.asarray(src)
 
 
 def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
@@ -249,6 +271,11 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
           - "j" : "Y"-dimension index of appropriate "U" or "V" velocity
           - "Yinc" : True if point was passed through while going in positive "j"-index direction
           - "Xinc" : True if point was passed through while going in positive "i"-index direction
+          - "q" : index into the *input* corner arrays of the corner each velocity face starts
+            at, so face k spans corners `q[k]` and `q[k]+1`. Because a consecutive pair of
+            corners at the same physical point defines no velocity face (see below), there are
+            in general fewer faces than corner steps and "q" is what relates the two: it is
+            strictly increasing, and skips exactly the steps that carried no face.
         For multi-tile grids (`f_c` given) the dict additionally contains:
           - "face" : face index of the velocity point
           - "Lsign" : +1 if the velocity's positive direction points left of the section's
@@ -274,8 +301,13 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
         nodes = ot.node_id[f_c, j_c + ot.t, i_c + ot.t]
         if (nodes < 0).any():
             raise ValueError("Section contains indices that are not grid corners.")
+        # Keep the LAST index of each run of repeated corners, not the first. Every index of
+        # a node rewrites to the same canonical native one, so which survives does not change
+        # a single emitted corner -- but it does decide which input step each face is
+        # attributed to in "q", and the real face is the one leaving the run, not entering it.
         keep = np.ones(nodes.size, dtype=bool)
-        keep[1:] = nodes[1:] != nodes[:-1]
+        keep[:-1] = nodes[:-1] != nodes[1:]
+        src = np.flatnonzero(keep)
         nat = ot.node_native[nodes[keep]]
         f_c, j_c, i_c = nat[:, 0].copy(), nat[:, 1].copy(), nat[:, 2].copy()
     else:
@@ -284,7 +316,7 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
         # seam-row corner with its mirrored column. Splice those twins in so that the
         # index arithmetic below -- which assumes consecutive corners are index-adjacent
         # -- reads the velocity face the section actually crossed. See `_insert_seam_twins`.
-        i_c, j_c = _insert_seam_twins(i_c, j_c, glon, glat, grid)
+        i_c, j_c, src = _insert_seam_twins(i_c, j_c, glon, glat, grid)
 
     nsec = i_c.size
     uvindices = {
@@ -292,7 +324,11 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
         "i":np.zeros(nsec-1, dtype=np.int64),
         "j":np.zeros(nsec-1, dtype=np.int64),
         "Yinc":np.zeros(nsec-1, dtype=bool),
-        "Xinc":np.zeros(nsec-1, dtype=bool)
+        "Xinc":np.zeros(nsec-1, dtype=bool),
+        # Which step of the *caller's* corner array each velocity face came from. Faces are
+        # dropped below, so this is what ties the returned faces back to the corners that
+        # produced them once the two are no longer one-to-one.
+        "q":np.asarray(src[:-1], dtype=np.int64),
     }
 
     if f_c is not None:
@@ -338,8 +374,8 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
             }
             uvindex["i"] += (offset if zonal else 0)
             uvindex["j"] += (offset if not(zonal) else 0)
-            for (key, v) in uvindices.items():
-                v[k] = uvindex[key]
+            for (key, value) in uvindex.items():
+                uvindices[key][k] = value
 
     # Drop zero-length faces. A single physical corner can carry two indices -- at a
     # periodic seam, a shared multi-tile boundary corner, or the bipolar fold seam -- so
@@ -732,6 +768,14 @@ def convergent_transport(
 
     dsout = dsout.assign_coords({
         "sign": orient_fact*sect["Lsign"],
+        # Which step of the caller's corner arrays each face came from. Faces and corner
+        # steps are not one-to-one (a step between two indices of the same physical corner
+        # carries no face), so this is what maps a result back onto the section's corners.
+        "q": xr.DataArray(
+            uvindices["q"],
+            coords=(dsout[sect_coord],),
+            dims=(sect_coord,)
+        ),
         "dir": xr.DataArray(
             np.array(["U" if u else "V" for u in sect["Umask"]]),
             coords=(dsout[sect_coord],),
