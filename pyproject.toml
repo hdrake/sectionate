@@ -53,3 +53,8 @@ version-file = "sectionate/_version.py"
 
 [tool.hatch.build]
 exclude = ["examples/**", "data/**"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: resolves a production-resolution grid; kept in the default run because it is the performance contract",
+]
