@@ -880,11 +880,20 @@ class CornerTopology:
         if bad.size:
             n = int(nodes[bad[0]])
             lon, lat, known = self._positions()
+            # Name the slot, not just the position: a corner stored on no face often
+            # has too few cells around it to place, so the position is usually the
+            # thing that is *not* available -- which makes for a useless message
+            # exactly where this fires.
+            slots = ", ".join(
+                f"(face={f}, J={J}, I={I})" for f, J, I in self.reps_of(n)[:3]
+            )
             where = (
-                f" (near lon={lon[n]:.3f}, lat={lat[n]:.3f})" if known[n] else ""
+                f", near lon={lon[n]:.3f}, lat={lat[n]:.3f}" if known[n]
+                else ", whose position the grid does not determine either"
             )
             raise ValueError(
-                f"Corner node {n}{where} is a real grid corner, but this grid stores "
+                f"Corner node {n} -- corner slot {slots}{where} -- is a real grid "
+                "corner, but this grid stores "
                 "it on no face, so it has no native (face, j, i) index to report.\n\n"
                 "A 'left' staggering drops each face's high corner row and a 'right' "
                 "one its low row, so a corner falling only on dropped rows is absent "
