@@ -176,5 +176,8 @@ def load_gridded_section(filepath, grid):
         grid,
         i_c=data["i_c"],
         j_c=data["j_c"],
+        # Deliberately not tolerant of files written before `f_c` was persisted:
+        # this release line makes no backwards-compatibility promise, and a section
+        # silently reloaded as single-tile would be mis-derived rather than refused.
         f_c=data["f_c"],
     )

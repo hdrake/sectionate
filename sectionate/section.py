@@ -172,6 +172,12 @@ class GriddedSection(Section):
         """
         from .topology import corner_topology
         ct = corner_topology(self.grid)
+        if (
+            (self.f_c < 0).any() or (self.f_c >= ct.nf).any()
+            or (self.j_c + ct.t < 0).any() or (self.j_c + ct.t >= ct.nqy).any()
+            or (self.i_c + ct.t < 0).any() or (self.i_c + ct.t >= ct.nqx).any()
+        ):
+            raise ValueError("Section contains indices that are not grid corners.")
         self.n_c = ct.node_id[self.f_c, self.j_c + ct.t, self.i_c + ct.t]
 
     def grid_section(self, **kwargs):

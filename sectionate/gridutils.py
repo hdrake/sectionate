@@ -3,7 +3,6 @@ import numpy as np
 import xarray as xr
 from xgcm.padding import pad as _module_pad
 
-
 def get_facedim(grid):
     """
     Return the name of the `grid`'s face/tile dimension if it has `face_connections`
@@ -18,7 +17,6 @@ def get_facedim(grid):
     str or None
     """
     return getattr(grid, "_facedim", None)
-
 
 def _pad_axes(grid, dims):
     """
@@ -49,7 +47,6 @@ def _pad_axes(grid, dims):
         if dims & set(axis.coords.values())
     ]
 
-
 def corner_position(grid):
     """
     Return the C-grid vorticity ("corner") position shared by the X and Y axes:
@@ -72,7 +69,6 @@ def corner_position(grid):
         "'left' position on both the X and Y axes are supported."
     )
 
-
 def corner_offset(grid):
     """
     Integer index shift from a vorticity ("corner") point to its staggered velocity
@@ -90,7 +86,6 @@ def corner_offset(grid):
         0 for 'outer'/'left', 1 for 'right'.
     """
     return {"outer": 0, "right": 1, "left": 0}[corner_position(grid)]
-
 
 def get_geo_corners(grid):
     """
@@ -126,7 +121,6 @@ def get_geo_corners(grid):
     if any([len(v) == 0 for (k,v) in geo_coord_dict.items()]):
         raise ValueError("""grid._ds must contain two-dimensional ("X", "Y") coordinates including the strings "lon" and "lat", consistent with grid.coords.""")
     return {k:v[0] for (k,v) in geo_coord_dict.items()}
-
 
 def coord_dict(grid):
     """
@@ -173,35 +167,3 @@ def check_outer(grid):
     """
     return corner_position(grid) == "outer"
 
-
-# ---------------------------------------------------------------------------
-# Topology-aware neighbor maps
-#
-# The section pathfinder walks corner-to-corner across the grid. Rather than
-# hard-coding how to step across periodic boundaries, multi-tile face seams, or
-# the bipolar north fold, we precompute -- for every corner point -- the
-# ([face,] j, i) index of each of its four neighbors ("right", "left", "up",
-# "down"). Where there is no neighbor -- a closed domain edge, i.e. a "fill" or
-# "extend" boundary -- the point is recorded as its own neighbor. A step in that
-# direction therefore stays put, so it never gets the walk closer to the target
-# and is never taken: the section stops at the boundary instead of running off
-# the array.
-#
-# For single-tile grids and multi-tile grids with shared ('outer') corners, the
-# topology logic lives upstream in `xgcm`: we pad index-valued arrays with the
-# grid's own boundary/`face_connections` metadata and read the halos (see
-#
-# Multi-tile grids with *staggered* ('left'/'right') corners -- MITgcm/ECCO
-# lat-lon-cap, cubed-sphere -- are different: a single face's corner lattice is
-# incomplete along two of its edges, a physical vorticity point may be stored
-# once, not at all, or more than once, and xgcm's halo padding of corner-position
-# arrays can land one corner off across rotated/reversed seams. For these grids
-# the neighbor maps are instead built from the grid's *outer* (shared-corner)
-# lattice: each face is extended by its missing corner row+column, and every
-# extended slot is resolved to the native corner that stores that physical point
-# by matching the surrounding tracer cells, which pad reliably (with a small
-# coordinate fallback only where too few of those cells survive to identify a
-# corner at all). The resulting global corner graph -- on which face seams, tile
-# junctions and grid cuts are all ordinary nodes -- is projected back onto native
-# ([face,] j, i) indices.
-# ---------------------------------------------------------------------------

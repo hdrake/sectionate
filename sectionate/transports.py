@@ -459,6 +459,18 @@ def convergent_transport(
             )
         else:
             # Closed section encloses a polygon: orient so `positive_in` means "into" it.
+            if np.any(np.abs(np.asarray(lats_q, dtype=float)) > 90. - 1.e-6):
+                warnings.warn(
+                    "This closed section has a corner on a geographic pole, and the "
+                    "inward sense of `positive_in` cannot be determined reliably "
+                    "there. Orientation comes from the signed area of a stereographic "
+                    "projection, which sends one pole to infinity, so a corner sitting "
+                    "on it dominates the area and can invert the result -- it does so "
+                    "for the cells around the Arctic cap's pole on a lat-lon-cap grid. "
+                    "Check the sign, or pass `positive_in` as a cell mask, which is "
+                    "decided from the cells either side of a face and does not use the "
+                    "projection at all."
+                )
             counterclockwise = is_section_counterclockwise(
                 lons_q, lats_q, geometry=geometry
             )

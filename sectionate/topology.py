@@ -41,16 +41,13 @@ import numpy as np
 import xarray as xr
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
-from xgcm.padding import pad as _module_pad
 
 try:  # xgcm >= 0.10.1
     from xgcm.padding import _is_fold_padding, _seam_partner_indices, _resolve_pivot
 except ImportError:  # pragma: no cover - keeps `import sectionate` working
     _is_fold_padding = _seam_partner_indices = _resolve_pivot = None
 
-from .gridutils import (
-    corner_position, get_facedim, get_geo_corners, _pad_axes,
-)
+from .gridutils import corner_position, get_facedim, get_geo_corners
 
 
 def _faced(da, dims, facedim):
@@ -119,40 +116,6 @@ def _seam_or_fill(padding):
         return padding
     return "fill"
 
-
-def seam_halo(grid, field, width=1, fill_value=np.nan):
-    """
-    Pad `field` by `width` cells, filling only across genuine seams.
-
-    A periodic wrap, a bipolar fold and a `face_connections` gluing all supply real
-    neighbouring values; every other boundary is a wall and is filled with
-    `fill_value` (NaN by default). This is the halo any topology-aware sweep over
-    tracer cells wants: `"extend"` padding would replicate the edge cell and make a
-    wall look like a connection.
-
-    Parameters
-    ----------
-    grid : xgcm.Grid
-    field : xr.DataArray
-        Any field whose dims include the horizontal axes to pad.
-    width : int or dict, optional
-        Halo width, per axis if a dict.
-    fill_value : float, optional
-
-    Returns
-    -------
-    xr.DataArray
-    """
-    axes = _pad_axes(grid, field.dims)
-    padding = {ax: _seam_or_fill(grid.axes[ax].padding) for ax in axes}
-    if isinstance(width, dict):
-        widths = {ax: width.get(ax, (0, 0)) for ax in axes}
-        widths = {
-            ax: (w, w) if np.isscalar(w) else tuple(w) for ax, w in widths.items()
-        }
-    else:
-        widths = {ax: (width, width) for ax in axes}
-    return _module_pad(field, grid, widths, padding=padding, fill_value=fill_value)
 
 
 class CornerTopology:

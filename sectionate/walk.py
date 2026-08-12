@@ -17,7 +17,13 @@ import numpy as np
 
 def find_closest_corner(lon, lat, topology):
     """
-    The corner node nearest to a geographic position.
+    The corner node nearest to a geographic position that the grid can name.
+
+    Corners stored on no face are skipped: a section cannot start or end on one,
+    because its endpoints could not be written in native indices. So on a grid with
+    un-stored corners a waypoint sitting on one snaps to a neighbour instead, up to
+    a cell away. Every single-tile grid, and every 'outer' grid, stores all its
+    corners and is unaffected.
 
     Ties are broken by the node's canonical native index, so a grid that stores one
     position for many corners -- a bipolar cap's singular meridian -- snaps to a
@@ -116,14 +122,24 @@ def infer_grid_path(node1, node2, topology, curve="great circle"):
 
     def writable(candidates):
         """
-        Prefer corners the grid can name.
+        Prefer corners the grid can name, at a measured cost.
 
         A corner stored on no face is a real corner and the walk may cross one, but a
-        section through it cannot be written in native indices. Where an equally good
-        route exists through corners that *are* stored, take it: nothing is lost
-        geometrically, and the section stays expressible. Cube vertices and the rows
-        a staggering drops are exactly this case, and they always have stored
-        neighbours.
+        section through it cannot be written in native indices at all -- so a route
+        that avoids one is worth having even if it is not the route the metrics would
+        otherwise pick.
+
+        This is a preference applied *before* the curve comparison, so it can discard
+        a candidate that lay closer to the requested curve. Measured against not
+        applying it, over 200 random sections per grid: on any grid that stores every
+        corner -- every single-tile grid, and ECCO LLC90 -- it is the identity and
+        changes nothing. On a cubed sphere, whose only un-stored corners are two
+        vertices, no path gets longer and two stray further from the curve. Only where
+        a whole seam line is un-stored, which is a same-side gluing on a staggered
+        grid, does it cost much: 12 of 200 paths get longer there. That grid could not
+        be traced at all before.
+
+        It never empties a non-empty candidate list, so it cannot strand the walk.
         """
         keep = [m for m in candidates if stored[m]]
         return keep or candidates

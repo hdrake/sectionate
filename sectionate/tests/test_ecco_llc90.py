@@ -31,15 +31,15 @@ def _load_grid():
     return load_ECCO_LLC90_grid(_DATA)
 
 
-def test_llc90_outer_topology_builds_and_is_well_formed():
-    """`outer_topology` builds on the real LLC90 grid, and every corner node is
+def test_llc90_corner_topology_builds_and_is_well_formed():
+    """the corner topology builds on the real LLC90 grid, and every corner node is
     well formed: no node has more than four neighbours (a >4 valence would mean the
     corner graph is inconsistent), every node has as many neighbours as it has
     tracer cells, and the corners stored on no face -- the rows a 'left' staggering
     drops along the domain's outer edge -- are corners all the same, with no native
     index to report."""
-    from sectionate.topology import corner_topology as outer_topology
-    ot = outer_topology(_load_grid())
+    from sectionate.topology import corner_topology
+    ot = corner_topology(_load_grid())
 
     deg = np.array([len(a) for a in ot.node_adj])
     native = ot.node_native[:, 0] >= 0
@@ -69,8 +69,8 @@ def test_llc90_three_tile_junction_resolves_to_one_node():
     the junction split into three separate degree-0 nodes. The velocity faces
     around it then read as zero from every neighbour's frame, leaking a spurious
     convergence into the junction's cells."""
-    from sectionate.topology import corner_topology as outer_topology
-    ot = outer_topology(_load_grid())
+    from sectionate.topology import corner_topology
+    ot = corner_topology(_load_grid())
 
     junctions = [
         n for n in range(len(ot.node_reps))
@@ -87,8 +87,8 @@ def test_llc90_polar_cut_lips_share_nodes():
     at lon +65) is native and merged exactly by `by_loc`: at least one node must
     carry native representations on BOTH tile 0 and tile 3 (the same physical
     corner stored twice, once per tile)."""
-    from sectionate.topology import corner_topology as outer_topology
-    ot = outer_topology(_load_grid())
+    from sectionate.topology import corner_topology
+    ot = corner_topology(_load_grid())
 
     shared = [
         n for n in range(len(ot.node_reps))
@@ -103,8 +103,8 @@ def test_llc90_face_corners_resolve_topologically():
     stored reports a native index inside the grid's own arrays. The four-tile
     junctions are where a halo-derived topology used to need repairing; read from
     the declarations they are ordinary corners."""
-    from sectionate.topology import corner_topology as outer_topology
-    ot = outer_topology(_load_grid())
+    from sectionate.topology import corner_topology
+    ot = corner_topology(_load_grid())
     nat = ot.node_native[ot.node_is_stored]
     assert (nat[:, 0] >= 0).all() and (nat[:, 0] < ot.nf).all()
     assert (nat[:, 1] >= 0).all() and (nat[:, 1] < ot.nyq).all()

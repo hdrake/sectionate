@@ -12,7 +12,7 @@ of which are committed -- Read the Docs never executes anything, so the artifact
 must already exist at build time.
 
 The walk is *not* reimplemented here. ``replay_walk`` mirrors the loop in
-``sectionate.section.infer_grid_path`` step by step so that the intermediate
+``sectionate.walk.infer_grid_path`` step by step so that the intermediate
 state (which neighbors exist, which are admitted, what each one's metrics are)
 can be recorded for drawing, but every number it computes comes from the
 package's own helpers, and ``main`` asserts that the replayed path is identical
@@ -188,7 +188,7 @@ def unwrap(lon, center=0.0):
 
 
 # ---------------------------------------------------------------------------
-# Instrumented replay of `sectionate.section.infer_grid_path`
+# Instrumented replay of `sectionate.walk.infer_grid_path`
 # ---------------------------------------------------------------------------
 def _compass(here, there):
     """A display label for the step from one corner to another.
