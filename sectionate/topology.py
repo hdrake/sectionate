@@ -60,6 +60,13 @@ def _faced(da, dims, facedim):
     return da.transpose(facedim, ..., *dims).values
 
 
+def _flat_step(lon0, lat0, lon1, lat1):
+    """Displacement in a local flat (east, north) frame, in degrees, with longitudes
+    scaled by cos(lat) and wrapped across the dateline."""
+    dlon = ((lon1 - lon0 + 180.0) % 360.0) - 180.0
+    return dlon * np.cos(np.deg2rad(0.5 * (lat0 + lat1))), (lat1 - lat0)
+
+
 def _lonlat_to_xyz(lon, lat):
     """Positions on the unit sphere, so that comparing them is free of the
     longitude wrap and of the pole's degenerate longitudes."""
@@ -475,7 +482,43 @@ class CornerTopology:
 
         self.labels = labels.astype(np.int64)
         self.node_id = self.labels.reshape(self.nf, self.nqy, self.nqx)
+        self._check_no_face_folds_onto_itself(gens)
         self._resolve_native()
+
+    def _check_no_face_folds_onto_itself(self, gens):
+        """
+        Catch a set of identifications that folds a face onto itself by accident.
+
+        Two different corners of one face are the same point only where the grid says
+        so -- a periodic wrap closing a single tile, or a fold seam glued to its own
+        mirror. Anywhere else it is a contradiction: it would merge, say, two opposite
+        vertices of a cube into one corner, and everything downstream would then
+        attribute their velocity faces to the wrong place. Rather than resolve to
+        something quietly wrong, say which face and which corners.
+        """
+        self_glued = {
+            int(f) for g in gens
+            for f in np.intersect1d(g.a[:, 0], g.b[:, 0])
+        }
+        for f in range(self.nf):
+            if f in self_glued:
+                continue
+            lab = self.node_id[f].ravel()
+            order = np.argsort(lab, kind="stable")
+            s = lab[order]
+            dup = np.flatnonzero(s[1:] == s[:-1])
+            if dup.size:
+                k = order[dup[0]]
+                k2 = order[dup[0] + 1]
+                J1, I1 = divmod(int(k), self.nqx)
+                J2, I2 = divmod(int(k2), self.nqx)
+                raise ValueError(
+                    f"The declared topology makes corners (J={J1}, I={I1}) and "
+                    f"(J={J2}, I={I2}) of face {f} the same physical point, but "
+                    "nothing glues that face to itself. Two seams of this face must "
+                    "disagree about how they line up -- check the axis and `reverse` "
+                    "flags of its `face_connections` entries."
+                )
 
     def _resolve_native(self):
         """
@@ -663,6 +706,48 @@ class CornerTopology:
                     cells.add((int(f), int(jc), int(ic)))
         return sorted(cells)
 
+    # -------------------------------------------------------------- plateaus
+
+    def plateau_labels(self, tolerance_m=1e-3):
+        """
+        Group corners that are distinct but sit at the same place.
+
+        A grid may separate corners that geography does not: a bipolar cap's
+        singular meridian is one point that a whole column of corners maps to, with
+        zero-length velocity faces between them. Keeping them distinct is what lets a
+        closed section say which of the fan's sectors it passed between -- but it
+        also leaves a walk with a *flat* metric over the whole column, where greedy
+        descent has nothing to choose on and the path would be decided by node
+        numbering.
+
+        So the walk treats such a group as one place to arrive at and leave, and
+        this labels them. It is geometry used to navigate, never to decide identity.
+        """
+        key = round(float(tolerance_m), 12)
+        cache = getattr(self, "_plateau_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        lon, lat, known = self._positions()
+        e = self.edges
+        a, b = e[:, 0], e[:, 1]
+        ok = known[a] & known[b]
+        xa = _lonlat_to_xyz(lon[a], lat[a])
+        xb = _lonlat_to_xyz(lon[b], lat[b])
+        chord = np.full(a.shape, np.inf)
+        chord[ok] = np.linalg.norm(xa[ok] - xb[ok], axis=-1) * 6.371e6
+        deg = chord < tolerance_m
+        if deg.any():
+            g = coo_matrix(
+                (np.ones(int(deg.sum()), dtype=np.int8), (a[deg], b[deg])),
+                shape=(self.n_nodes, self.n_nodes),
+            )
+            _, labels = connected_components(g, directed=False, return_labels=True)
+        else:
+            labels = np.arange(self.n_nodes, dtype=np.int64)
+        labels = labels.astype(np.int64)
+        self._plateau_cache = (key, labels)
+        return labels
+
     # ------------------------------------------------------ edges -> velocities
 
     def edge_velocities(self, node_a, node_b):
@@ -707,6 +792,47 @@ class CornerTopology:
                     if 0 <= j < self.nyq and 0 <= ic < Nxc:
                         out.append(("V", f, j, ic, gid(J, ic), gid(J - 1, ic)))
         return out
+
+    @property
+    def face_handedness(self):
+        """
+        Whether each face's `+i, +j` axes are right-handed on the sphere, as `+-1`.
+
+        A velocity face's sign relative to a section is a question about *sides* --
+        does the stored velocity point to the left of the way we are going? -- and in
+        the frame the velocity is stored in that is pure index arithmetic. The only
+        thing the frame cannot tell you is whether it is mirrored relative to the
+        world, so that is measured once per face here, from one cell, rather than per
+        edge from the section's own geometry. A section edge whose two corners
+        coincide (a polar fan) then still gets a definite answer, where a cross
+        product of two zero-length steps would not.
+        """
+        if getattr(self, "_handed", None) is not None:
+            return self._handed
+        geo = get_geo_corners(self.grid)
+        cd = self.coords
+        Yq, Xq = cd["Y"]["corner"], cd["X"]["corner"]
+        lon = _faced(geo["X"], (Yq, Xq), self.facedim).astype(float)
+        lat = _faced(geo["Y"], (Yq, Xq), self.facedim).astype(float)
+        handed = np.ones(self.nf, dtype=np.int64)
+        for f in range(self.nf):
+            found = False
+            for j in range(self.nyq - 1):
+                for i in range(self.nxq - 1):
+                    p, px, py = (lat[f, j, i], lat[f, j, i + 1], lat[f, j + 1, i])
+                    if not (np.isfinite(p) and np.isfinite(px) and np.isfinite(py)):
+                        continue
+                    ex = _flat_step(lon[f, j, i], p, lon[f, j, i + 1], px)
+                    ey = _flat_step(lon[f, j, i], p, lon[f, j + 1, i], py)
+                    cross = ex[0] * ey[1] - ex[1] * ey[0]
+                    if abs(cross) > 1e-12:
+                        handed[f] = 1 if cross > 0 else -1
+                        found = True
+                        break
+                if found:
+                    break
+        self._handed = handed
+        return handed
 
     # ----------------------------------------------------------- native output
 
@@ -788,6 +914,25 @@ class CornerTopology:
                 "coordinates carry the periodicity or fold the grid declares."
             )
         return worst
+
+
+def corner_topology(grid, identifications=None):
+    """
+    The `CornerTopology` of `grid`, cached on the grid instance.
+
+    Resolving the topology touches every corner of the grid once, so it is worth
+    reusing across the several places in a section's life that need it.
+    """
+    if identifications:
+        return CornerTopology(grid, identifications=identifications)
+    cached = getattr(grid, "_sectionate_corner_topology", None)
+    if cached is None:
+        cached = CornerTopology(grid)
+        try:
+            grid._sectionate_corner_topology = cached
+        except AttributeError:  # pragma: no cover - a grid that forbids attributes
+            pass
+    return cached
 
 
 def _contiguous_runs(partner):

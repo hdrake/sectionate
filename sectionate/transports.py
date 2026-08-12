@@ -171,6 +171,100 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
             direction of travel, else -1 (a geometric sign that stays consistent across
             rotated face seams; used in place of "Xinc"/"Yinc").
     """
+    from .topology import corner_topology
+
+    i_c = np.asarray(i_c, dtype=np.int64)
+    j_c = np.asarray(j_c, dtype=np.int64)
+    topology = corner_topology(grid)
+    t = topology.t
+    faces = (np.zeros_like(i_c) if f_c is None else np.asarray(f_c, dtype=np.int64))
+
+    # Which physical corner each given index denotes. Everything below is decided
+    # from these, so it does not matter which of a corner's spellings the caller
+    # used, nor whether a seam crossing was written with both of them or one.
+    if (
+        (faces < 0).any() or (faces >= topology.nf).any()
+        or (j_c + t < 0).any() or (j_c + t >= topology.nqy).any()
+        or (i_c + t < 0).any() or (i_c + t >= topology.nqx).any()
+    ):
+        raise ValueError("Section contains indices that are not grid corners.")
+    nodes = topology.node_id[faces, j_c + t, i_c + t]
+
+    handed = topology.face_handedness
+    var, vi, vj, vface, lsign, qq, xinc, yinc = [], [], [], [], [], [], [], []
+
+    for k in range(nodes.size - 1):
+        a, b = int(nodes[k]), int(nodes[k + 1])
+        if a == b:
+            # Two spellings of one corner. The step spans no cell, so it is not a
+            # velocity face -- this is how a seam crossing is written, and dropping
+            # it here is what stops the crossing being counted twice.
+            continue
+        stored = topology.edge_velocities(a, b)
+        if not stored:
+            raise ValueError(
+                f"The section steps from corner (face={faces[k]}, j={j_c[k]}, "
+                f"i={i_c[k]}) to (face={faces[k+1]}, j={j_c[k+1]}, i={i_c[k+1]}), "
+                "which is not one step across a velocity face. Either the two "
+                "corners are not neighbours on this grid, or the face between them "
+                "is stored on none of its arrays. A section must step from each "
+                "corner to an adjacent one."
+            )
+        # Prefer the storage on the face the section is already in, so a velocity is
+        # read in the frame it was written in and nothing has to be rotated.
+        pick = next((s for s in stored if s[1] == faces[k]), stored[0])
+        v, f, jv, iv, _to_cell, _from_cell = pick
+
+        # The section's direction of travel, in the frame that holds the velocity.
+        step = _travel_in_face(topology, a, b, f)
+        if v == "U":
+            # `+x` velocity: it points left of travel when travel runs in `-y`.
+            s = -1 if step[0] > 0 else 1
+        else:
+            # `+y` velocity: it points left of travel when travel runs in `+x`.
+            s = 1 if step[1] > 0 else -1
+
+        var.append(v)
+        vi.append(int(iv))
+        vj.append(int(jv))
+        vface.append(int(f))
+        lsign.append(int(s) * int(handed[f]))
+        xinc.append(bool(step[1] > 0))
+        yinc.append(bool(step[0] > 0))
+        qq.append(k)
+
+    uvindices = {
+        "var": np.array(var, dtype="<U2"),
+        "i": np.array(vi, dtype=np.int64),
+        "j": np.array(vj, dtype=np.int64),
+        "Yinc": np.array(yinc, dtype=bool),
+        "Xinc": np.array(xinc, dtype=bool),
+        "Lsign": np.array(lsign, dtype=np.int64),
+        "q": np.array(qq, dtype=np.int64),
+    }
+    if f_c is not None:
+        uvindices["face"] = np.array(vface, dtype=np.int64)
+    return uvindices
+
+
+def _travel_in_face(topology, node_a, node_b, face):
+    """The step from `node_a` to `node_b` as `(dJ, dI)` in `face`'s own frame."""
+    reps_b = {
+        (int(J), int(I))
+        for f, J, I in topology.reps_of(node_b) if int(f) == face
+    }
+    for f, Ja, Ia in topology.reps_of(node_a):
+        if int(f) != face:
+            continue
+        for Jb, Ib in reps_b:
+            if abs(int(Ja) - Jb) + abs(int(Ia) - Ib) == 1:
+                return (Jb - int(Ja), Ib - int(Ia))
+    raise ValueError(  # pragma: no cover - `edge_velocities` found the pair already
+        f"Corners {node_a} and {node_b} are not adjacent on face {face}."
+    )
+
+
+def _legacy_uvindices_from_qindices(grid, i_c, j_c, f_c=None):
     i_c = np.asarray(i_c)
     j_c = np.asarray(j_c)
     offset = corner_offset(grid)
@@ -546,14 +640,11 @@ def convergent_transport(
     sect["Umask"] = xr.DataArray(uvindices["var"]=="U", dims=sect_coord)
     sect["Vmask"] = xr.DataArray(uvindices["var"]=="V", dims=sect_coord)
 
-    # Per-edge sign: +1 if the velocity's positive direction points left of the section's
-    # direction of travel. Multi-tile grids carry this geometrically (`Lsign`), so it stays
-    # consistent across rotated faces; single-tile grids reduce to the original face-frame
-    # Usign/Vsign, leaving those results unchanged.
-    if facedim is not None:
-        sect["Lsign"] = xr.DataArray(uvindices["Lsign"], dims=sect_coord)
-    else:
-        sect["Lsign"] = sect["Usign"]*sect["Umask"] + sect["Vsign"]*sect["Vmask"]
+    # Per-edge sign: +1 if the velocity's positive direction points left of the
+    # section's direction of travel. Both are read in the frame the velocity is
+    # stored in, so a rotated or reversed seam needs no special case, and an edge
+    # whose two corners happen to coincide still gets a definite answer.
+    sect["Lsign"] = xr.DataArray(uvindices["Lsign"], dims=sect_coord)
 
     mask_types = (np.ndarray, dask.array.Array, xr.DataArray)
     if isinstance(positive_in, mask_types):

@@ -308,29 +308,51 @@ def grid_section(grid, lons, lats, curve="great circle"):
         multi-tile grids, the face index f_c of each point is returned as well.
         (lons_c, lats_c) are the corresponding longitude and latitudes.
     """
-    geocorners = get_geo_corners(grid)
-    facedim = get_facedim(grid)
+    from .topology import corner_topology
+    from .walk import find_closest_corner, infer_grid_path, native_path
 
+    facedim = get_facedim(grid)
     if facedim is not None:
         _check_supported_topology(grid)
 
-    # All topologies -- periodic wrap, fill/extend walls, multi-tile face
-    # connections, and the bipolar north fold -- are derived uniformly from the
-    # grid's xgcm metadata by padding index arrays (see `build_neighbor_maps`).
-    # Where a single physical corner carries two indices (a periodic seam, a shared
-    # multi-tile boundary corner, or the fold seam), the walk simply steps through
-    # both; the resulting zero-length section edge carries no flux and is dropped when
-    # faces are derived (see `transports.uvindices_from_qindices`).
-    neighbor_maps = build_neighbor_maps(grid, geocorners)
+    # Every topology a structured grid can declare -- a periodic wrap, a wall, a
+    # bipolar fold, a multi-tile seam however it is rotated -- becomes an ordinary
+    # edge of the grid's physical corner graph, so the walk below needs no case for
+    # any of them, and never has to ask whether two indices are the same corner.
+    topology = corner_topology(grid)
 
-    return create_section_composite(
-        geocorners["X"],
-        geocorners["Y"],
-        lons,
-        lats,
-        neighbor_maps=neighbor_maps,
-        curve=curve,
-    )
+    if len(lons) != len(lats):
+        raise ValueError("lons and lats should have the same length")
+
+    nodes = []
+    for k in range(len(lons) - 1):
+        segment_curve = _check_segment_span(
+            lons[k], lats[k], lons[k + 1], lats[k + 1], curve
+        )
+        n1 = find_closest_corner(lons[k], lats[k], topology)
+        n2 = find_closest_corner(lons[k + 1], lats[k + 1], topology)
+        seg = infer_grid_path(n1, n2, topology, curve=segment_curve)
+        nodes.extend(seg[:-1] if k < len(lons) - 2 else seg)
+
+    corners, _ = native_path(topology, nodes)
+    f_c, j_c, i_c = corners[:, 0], corners[:, 1], corners[:, 2]
+
+    # Report each corner's coordinate as its *emitted* representation stores it, not
+    # as the node's canonical one. The two are the same physical point, but a
+    # periodic seam's two spellings differ by a turn of longitude, and it is the
+    # emitted one that keeps the reported path continuous -- 300, 360 rather than
+    # 300, 0 -- which is what anything measuring a step along it depends on.
+    geo = get_geo_corners(grid)
+    glon = geo["X"].values
+    glat = geo["Y"].values
+    if facedim is None:
+        lons_c, lats_c = glon[j_c, i_c], glat[j_c, i_c]
+    else:
+        lons_c, lats_c = glon[f_c, j_c, i_c], glat[f_c, j_c, i_c]
+
+    if facedim is not None:
+        return i_c, j_c, f_c, lons_c, lats_c
+    return i_c, j_c, lons_c, lats_c
 
 
 def _check_supported_topology(grid):
