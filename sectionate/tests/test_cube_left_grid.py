@@ -15,7 +15,7 @@ import xgcm
 import pytest
 
 from sectionate.gridutils import corner_position
-from sectionate.topology import corner_topology as outer_topology
+from sectionate.topology import corner_topology as outer_topology  # the grid's corner topology
 from sectionate.section import grid_section
 from sectionate.transports import convergent_transport
 
@@ -383,14 +383,14 @@ def test_cube_section_over_pole_has_stable_geometric_sign(lonlat, faces_expected
     """A section whose great circle passes over the geographic north pole -- the one
     soft spot of the geometric per-edge sign that Geoff flagged in review.
 
-    ``_left_sign`` (transports.py) orients each edge by a cross product in a local
+    The per-edge sign orients each edge in the frame the velocity is stored in, in a
     flat (east, north) frame, which degenerates exactly at the pole: ``cos(lat) -> 0``
     shrinks the east component and longitude is ill-defined at the +Z face-center
     corner, which this cube stores right on ``lat = 90``. The pole-adjacent edges
     carry real flux, so a sign that flipped there would break the exact
     equality by a finite amount. The single-tile bipolar fold signs via
     ``Usign``/``Vsign`` instead, so this multi-tile cube (whose polar cap actually
-    invokes ``_left_sign``) is where the concern must be pinned down.
+    invokes that sign) is where the concern must be pinned down.
     """
     grid, psi = cube_left_grid()
     (lon0, lon1), (lat0, lat1) = lonlat
@@ -618,24 +618,35 @@ def test_outer_reverse_gluing_matches_by_coincidence():
     assert np.isclose(abs(float(conv)), abs(p1 - p0), rtol=1e-9)
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "Known, pre-existing: a closed section with a corner exactly at a geographic "
+    "pole gets `positive_in` inverted. Orientation comes from the signed area of a "
+    "stereographic projection, and that projection sends one pole to infinity, so a "
+    "corner sitting on it projects to a radius that swamps the area. Not introduced "
+    "here -- it is unreachable on the base branch only because sections could not be "
+    "traced through such corners at all. Fixing it needs a decision this change does "
+    "not make: measuring the area on the sphere instead is exact at the poles but "
+    "degenerate for a section that follows a great circle (an equatorial latitude "
+    "circle encloses exactly half the sphere either way round), and choosing the "
+    "projection point per section silently redefines which cap `positive_in` means."
+))
 def test_closed_loop_with_a_polar_corner_gets_the_inward_sense_right():
     """
     A corner exactly at a geographic pole is ordinary, not exotic: it is a vertex of
     every cell of an Arctic cap, and where a tripolar cap's singular meridian ends.
 
-    Orientation is decided by the signed area of a stereographic projection, and that
-    projection sends one pole to infinity -- so a corner sitting on it projects to a
-    huge radius that swamps the area and can invert `positive_in` for the whole
-    section. The oracle is the discrete divergence theorem, which knows nothing of
+    The oracle is the discrete divergence theorem, which knows nothing of
     projections: the flux into a cell, integrated round its boundary, must equal that
     cell's convergence computed straight from the staggered arrays.
     """
     import warnings as _warnings
+    from sectionate.gridutils import get_geo_corners
 
-    grid, _psi = _cube_variant((0,) * 6, stagger="outer")
+    grid, _psi = _cube_variant(_find_all_low_high_rotations(), stagger="outer")
     ds = grid._ds
     cd = {a: grid.axes[a].coords for a in ("X", "Y")}
-    Xc, Yc, Xq, Yq = cd["X"]["center"], cd["Y"]["center"], cd["X"]["outer"], cd["Y"]["outer"]
+    Xc, Yc = cd["X"]["center"], cd["Y"]["center"]
+    Xq, Yq = cd["X"]["outer"], cd["Y"]["outer"]
     nf, nyc, nxc = ds.sizes["face"], ds.sizes[Yc], ds.sizes[Xc]
 
     rng = np.random.default_rng(0)
@@ -646,29 +657,27 @@ def test_closed_loop_with_a_polar_corner_gets_the_inward_sense_right():
                   padding="fill", fill_value=np.nan,
                   face_connections=grid._face_connections, autoparse_metadata=False)
 
-    from sectionate.gridutils import get_geo_corners
-    geo = get_geo_corners(g)
-    lat_c = geo["Y"].transpose("face", Yq, Xq).values
-    polar = np.argwhere(np.isclose(np.abs(lat_c), 90.0))
-    assert polar.size, "this cube should have corners exactly at a pole"
+    lat_c = get_geo_corners(g)["Y"].transpose("face", Yq, Xq).values
+    polar = {(int(f), int(J), int(I))
+             for f, J, I in np.argwhere(np.isclose(np.abs(lat_c), 90.0))}
+    assert polar, "this cube should have corners exactly at a pole"
 
-    checked = 0
-    for f, J, I in polar:
-        for jc, ic in ((J - 1, I - 1), (J - 1, I), (J, I - 1), (J, I)):
-            if not (0 <= jc < nyc and 0 <= ic < nxc):
-                continue
-            want = u[f, jc, ic] - u[f, jc, ic + 1] + v[f, jc, ic] - v[f, jc + 1, ic]
-            mask = np.zeros((nf, nyc, nxc)); mask[f, jc, ic] = 1
-            m = xr.DataArray(mask, dims=("face", Yc, Xc))
-            i_c = [ic, ic + 1, ic + 1, ic, ic]
-            j_c = [jc, jc, jc + 1, jc + 1, jc]
-            with _warnings.catch_warnings():
-                _warnings.simplefilter("ignore")
-                out = convergent_transport(g, i_c, j_c, f_c=[f] * 5,
-                                           utr="ut", vtr="vt", positive_in=m)
-            got = float(out["conv_mass_transport"].sum().values)
-            assert got == pytest.approx(want, abs=1e-12), (
-                f"cell (face={f}, j={jc}, i={ic}) touching the pole"
-            )
-            checked += 1
-    assert checked >= 4
+    wrong = []
+    for f in range(nf):
+        for jc in range(nyc):
+            for ic in range(nxc):
+                touches = {(f, jc, ic), (f, jc, ic + 1), (f, jc + 1, ic), (f, jc + 1, ic + 1)}
+                if not (touches & polar):
+                    continue
+                want = u[f, jc, ic] - u[f, jc, ic + 1] + v[f, jc, ic] - v[f, jc + 1, ic]
+                # the default `positive_in=True`, so the inward sense comes from the
+                # section's own orientation -- the path the projection decides
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore")
+                    out = convergent_transport(
+                        g, [ic, ic + 1, ic + 1, ic, ic], [jc, jc, jc + 1, jc + 1, jc],
+                        f_c=[f] * 5, utr="ut", vtr="vt")
+                got = float(out["conv_mass_transport"].sum().values)
+                if abs(got - want) > 1e-12:
+                    wrong.append((f, jc, ic, got, want))
+    assert not wrong, f"{len(wrong)} polar cells have an inverted inward sense: {wrong[:3]}"

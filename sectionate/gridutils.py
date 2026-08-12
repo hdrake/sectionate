@@ -190,7 +190,6 @@ def check_outer(grid):
 # For single-tile grids and multi-tile grids with shared ('outer') corners, the
 # topology logic lives upstream in `xgcm`: we pad index-valued arrays with the
 # grid's own boundary/`face_connections` metadata and read the halos (see
-# `build_neighbor_maps`).
 #
 # Multi-tile grids with *staggered* ('left'/'right') corners -- MITgcm/ECCO
 # lat-lon-cap, cubed-sphere -- are different: a single face's corner lattice is
@@ -204,13 +203,5 @@ def check_outer(grid):
 # coordinate fallback only where too few of those cells survive to identify a
 # corner at all). The resulting global corner graph -- on which face seams, tile
 # junctions and grid cuts are all ordinary nodes -- is projected back onto native
-# ([face,] j, i) indices. See `_OuterTopology`.
+# ([face,] j, i) indices.
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-

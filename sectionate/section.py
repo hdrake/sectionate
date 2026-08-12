@@ -366,7 +366,7 @@ def _check_supported_topology(grid):
     Raise if the multi-tile `grid` describes a topology sectionate cannot trace a section on.
 
     A section is traced by walking a graph of corner points, and a step across a tile seam is
-    recognised by its two ends having different face indices (see `transports._uv_for_edge`).
+    recognised by its two ends belonging to different faces.
     
     A face glued to *itself* therefore cannot be traced: both sides of such a seam carry the
     same face index, so a crossing is indistinguishable from an ordinary step within the face,
@@ -379,7 +379,7 @@ def _check_supported_topology(grid):
     A grid can still prove unsupported once its corner graph is actually built -- a corner that
     ends up with more than four neighbours, or a staggered grid whose seam corners are stored on
     no face, for instance. Those are rejected there, each with its own reason; see
-    `gridutils.build_neighbor_maps` and `gridutils._OuterTopology`.
+    `sectionate.topology.CornerTopology`.
     """
     facedim = grid._facedim
     connections = (getattr(grid, "_face_connections", None) or {}).get(facedim, {})

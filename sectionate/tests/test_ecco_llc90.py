@@ -1,5 +1,5 @@
 """Real-data topology checks on the ECCOv4r4 native 13-tile lat-lon-cap (LLC90)
-grid. These validate `_OuterTopology` on a genuine, hard multi-tile grid --
+grid. These validate the corner topology on a genuine, hard multi-tile grid --
 rotated seams, the Arctic cap, the tiles-2/6/10 three-tile junction, and the
 65E/115W polar grid cut -- rather than on a synthetic fixture.
 

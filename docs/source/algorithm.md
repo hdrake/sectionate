@@ -9,7 +9,7 @@ Everything below is the single-tile, `curve="great circle"` case, which is the d
 entry point is:
 
 ```python
-i_c, j_c, lons_c, lats_c = sectionate.grid_section(grid, lons, lats)
+i_c, j_c, f_c, lons_c, lats_c = sectionate.grid_section(grid, lons, lats)
 ```
 
 `grid_section` reads the grid's topology, then hands each consecutive pair of waypoints to a
@@ -17,10 +17,10 @@ walk:
 
 | stage | what it does |
 |---|---|
-| `grid_section` | reads corner coordinates and builds the topology-aware neighbour maps |
-| `create_section_composite` | loops over consecutive waypoint pairs and stitches the segments |
-| `infer_grid_path_from_geo` | checks the segment spans less than 180°, then snaps both waypoints to their nearest corners |
-| `infer_grid_path` | **the walk** — steps from corner to corner until it reaches the endpoint |
+| `grid_section` | resolves the grid's corner topology, then loops over consecutive waypoint pairs and stitches the segments |
+| `walk.find_closest_corner` | snaps each waypoint to the corner nearest it |
+| `walk.infer_grid_path` | **the walk** — steps from corner to corner until it reaches the endpoint |
+| `walk.native_path` | writes the corners it visited back as `(face, j, i)` indices |
 
 ## The walk, one step at a time
 
@@ -39,8 +39,8 @@ placing each requested waypoint and the grid corner it snaps to, then takes eigh
 
 Each iteration plays out in three beats:
 
-1. **probe** — look up all four neighbours of the current corner in the neighbour maps, and
-   discard the ones that are not legal moves;
+1. **probe** — ask the corner graph for the current corner's neighbours, and discard the ones
+   that are not legal moves;
 2. **admit** — draw the *admission circle* and keep only the neighbours that get strictly
    closer to the endpoint;
 3. **commit** — among those, step to the one closest to the target great circle, and shade
@@ -48,31 +48,27 @@ Each iteration plays out in three beats:
 
 ## One step in detail
 
-Each iteration of `infer_grid_path` applies three rules in order.
+Each iteration of `walk.infer_grid_path` applies three rules in order.
 
-### 1. Enumerate the four neighbours, and drop the illegal ones
+### 1. Enumerate the corner's neighbours, and drop the illegal ones
 
-The walk never computes `i+1`. It asks the neighbour maps, which are built once by
-`gridutils.build_neighbor_maps` and encode the grid's whole topology:
+The walk never computes `i+1`, and it has no notion of "right" or "up". It asks the corner
+graph, which `sectionate.topology` resolves once from the grid's declared metadata:
 
 ```python
-neighbors = [
-    neighbor("right", f, j, i),
-    neighbor("left",  f, j, i),
-    neighbor("down",  f, j, i),
-    neighbor("up",    f, j, i),
-]
+topology.neighbors(here)
 ```
 
-Two of those four can be illegal, and both are handled by one small set, `skip = {here, prev}`:
+A corner usually has four neighbours, but not always: a cube vertex has three, and a corner on
+a walled edge has three because there is simply no edge beyond the wall — a wall is a *missing*
+neighbour rather than a special value. On this grid the Y axis uses `extend` padding, so the top
+and bottom corner rows have nothing above and below them.
 
-- **a wall.** `build_neighbor_maps` represents an unconnected edge by making the point its own
-  neighbour, so a wall is simply a neighbour equal to the current point. On this grid the Y
-  axis uses `extend` padding, so the top and bottom corner rows have no neighbour beyond them.
-- **the corner we just came from.** Excluding it is what keeps the walk from oscillating.
+One neighbour is always dropped: **the corner we just came from**. Excluding it is what keeps
+the walk from oscillating.
 
-The probe order — `right`, `left`, `down`, `up` — matters in exactly one place: the endpoint
-short-circuit below takes the *first* neighbour it finds coinciding with the endpoint.
+There is no probe order to speak of, because there are no directions to probe in. Where two
+candidates are equally good, the tie is broken on their indices (rule 3).
 
 ### 2. Admit only the neighbours that make progress
 
@@ -94,12 +90,13 @@ is the **admission circle** in the animation, and watching it shrink is watching
 converge.
 
 This is also what drives the walk to converge: in the ordinary case each step strictly reduces
-the remaining distance, so it cannot circle back. Two deliberate exceptions keep that from
-being an absolute guarantee — a neighbour that is the *same physical point* reached by a
-different index (the twin corners that exist along a fold seam) is admitted even though it
-closes no distance, and if nothing at all is admissible the walk falls back to the nearest
-legal neighbour, which may move away. `infer_grid_path` therefore also carries a hard step
-budget and raises rather than looping forever.
+the remaining distance, so it cannot circle back. One exception keeps that from being an
+absolute guarantee — if nothing at all is admissible the walk falls back to the nearest legal
+neighbour, which may move away — so `infer_grid_path` also carries a hard step budget and
+raises rather than looping forever.
+
+There is no exception for seams. A corner that a grid spells twice is *one* corner here, so
+stepping "onto its twin" is not a move the walk can make or has to allow for.
 
 ### 3. Among the admitted, take the one closest to the great circle
 
@@ -128,33 +125,30 @@ Two details finish the rule:
   `WALK_DEVIATION_ATOL` (1e-9 radians) of the best are treated as tied, and the one with the
   lowest `(face, j, i)` wins. Without this, a genuine geometric tie would resolve differently
   on different platforms, because it would come down to floating-point noise.
-- **arriving is special-cased.** If any legal neighbour coincides with the endpoint — within
-  `COINCIDENT_TOLERANCE_M`, one millimetre — the walk steps onto it immediately and never
-  evaluates `deviation` at all. That matters because `deviation` *at* the endpoint is
-  degenerate: the arc from the endpoint to itself has no direction. Steps 5 and 8 in the
-  animation are these arrivals, and their metric columns are blank because the algorithm
-  genuinely does not compute them.
+- **arriving needs no special case.** The walk stops when it reaches the end *corner*, which is
+  an integer comparison, so there is no tolerance and no short-circuit. `deviation` is never
+  evaluated at the endpoint, because once you are standing on it there is nothing left to
+  choose.
 
-## Why the neighbour maps carry the topology
+## Why the corner graph carries the topology
 
-Nothing in the three rules above knows what kind of grid it is walking on. That is the point
-of routing every step through `build_neighbor_maps`: the maps are built once by padding
-index-valued arrays with `xgcm` and reading back the halos, so whatever the grid's metadata
-encodes — a periodic wrap, a fill or extend wall, a bipolar north fold, or the face
-connections of a multi-tile grid — arrives as ordinary neighbour entries.
+Nothing in the three rules above knows what kind of grid it is walking on. That is the point of
+moving on the corner graph, which `sectionate.topology` resolves once from what the grid
+*declares* — each axis' padding, its `face_connections` — so a periodic wrap, a wall, a bipolar
+north fold and a rotated tile seam all arrive as ordinary edges between ordinary corners.
 
-A periodic wrap is the simplest illustration. On this grid the `right` neighbour of the last
-column, `i = 23`, simply *is* `i = 0`: geographically an ordinary step east, in index space a
-jump across the whole array. The walk needs no case for it and contains no wrap-around
-arithmetic. A wall is handled by the same mechanism from the other direction — an unconnected
-edge is encoded as a corner being its own neighbour, which the `skip` set already discards.
+A periodic wrap is the simplest illustration. On this grid the corner at `i = 24` and the
+corner at `i = 0` are not two corners that happen to coincide: the declaration says the axis
+wraps, so they are one corner, with two spellings. Stepping east from `i = 23` reaches it like
+any other step. The walk needs no case for it and contains no wrap-around arithmetic. A wall is
+the same idea from the other side — nothing is declared beyond the edge, so there is no edge in
+the graph, and the neighbour simply is not there.
 
 This is also why `grid_section` has no `topology` keyword: there is nothing for a caller to
 declare, and no way for a caller to declare it wrongly.
 
-The grey mesh drawn behind the corners in the animation comes from those same maps rather than
-from index arithmetic, so it is literally the graph the walk is allowed to move on — a wall
-shows up in it as a missing edge, and a seam-crossing face as a real one.
+The grey mesh drawn behind the corners in the animation *is* that graph, drawn edge for edge —
+so a wall shows up as a missing edge and a seam-crossing face as a real one.
 
 Grids with folds, caps and cuts push this much further, and are where the payoff is — see
 [notebook 4](examples/4_sections_on_global_tripolar_grid.ipynb) for a tripolar grid with a
@@ -196,7 +190,7 @@ grid = xgcm.Grid(
     autoparse_metadata=False,
 )
 
-i_c, j_c, lons_c, lats_c = grid_section(
+i_c, j_c, f_c, lons_c, lats_c = grid_section(
     grid, [62.0, 104.0, 136.0], [42.0, 58.0, 48.0]
 )
 print("i_c  ", i_c)
@@ -211,7 +205,7 @@ j_c   [12 13 13 13 14 14 14 13 13]
 Nine corners for eight steps, and reading the two together shows the staircase: `i` advances
 while `j` holds, then `j` advances while `i` holds. Note also that the two segments share the
 corner the middle waypoint snapped to — `(i=7, j=14)`, which appears exactly once:
-`create_section_composite` drops each segment's final point so that shared corner is not
+`grid_section` drops each segment's final point so that shared corner is not
 duplicated.
 
 ## From corners to transports
@@ -224,9 +218,10 @@ indices:
 ```python
 from sectionate.transports import uvindices_from_qindices
 
-uv = uvindices_from_qindices(grid, i_c, j_c)
+uv = uvindices_from_qindices(grid, i_c, j_c, f_c=f_c)
 # uv["var"] is "U" or "V" per face; uv["i"], uv["j"] index that velocity;
-# uv["Xinc"], uv["Yinc"] record the direction of travel through each face.
+# uv["Lsign"] is +1 where the stored velocity points left of travel;
+# uv["q"] says which step of the corner chain each face came from.
 ```
 
 Whether a face is a `U` or a `V` point falls straight out of which way the step went, though
@@ -236,8 +231,15 @@ a zonal edge is meridional, a `V` point. A step in `j` traverses a meridional ed
 `U`. The corner-to-velocity index offset depends on where vorticity sits in the grid's
 staggering (`outer`, `right` or `left`) and is read from the grid rather than assumed.
 
-"Up to" `N-1`, because a consecutive pair that resolves to the same physical point — the twin
-corners of a seam again — spans no cell and carries no flux, so it emits no face at all.
+"Up to" `N-1`, because a section crossing a seam is usually written with *both* spellings of
+the corner it crosses at, and the step between two spellings of one corner spans no cell. Since
+the two are the same corner, that is an integer comparison rather than a distance, and the step
+emits no face. `uv["q"]` is what relates the two lengths back together: face `k` spans corners
+`q[k]` and `q[k] + 1`, so a per-face result can be put back onto the corners it came from.
+
+That also means `uvindices_from_qindices` does not care which spelling you hand it. A section
+traced here, one traced on a cell mask, and one reloaded from saved indices all describe the
+same faces, however each of them happened to write its seam crossings.
 
 `transports.convergent_transport` then accumulates the signed normal transport through those
 faces. For a **closed** section it works out the traversal orientation and signs everything so
