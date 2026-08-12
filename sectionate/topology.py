@@ -48,7 +48,26 @@ try:  # xgcm >= 0.10.1
 except ImportError:  # pragma: no cover - keeps `import sectionate` working
     _is_fold_padding = _seam_partner_indices = _resolve_pivot = None
 
-from .gridutils import coord_dict, corner_position, get_facedim, _pad_axes
+from .gridutils import (
+    corner_position, get_facedim, get_geo_corners, _pad_axes,
+)
+
+
+def _faced(da, dims, facedim):
+    """`da`'s values with a leading face axis, real or synthetic."""
+    if facedim is None:
+        return da.transpose(*dims).values[None, ...]
+    return da.transpose(facedim, ..., *dims).values
+
+
+def _lonlat_to_xyz(lon, lat):
+    """Positions on the unit sphere, so that comparing them is free of the
+    longitude wrap and of the pole's degenerate longitudes."""
+    lon = np.deg2rad(np.asarray(lon, dtype=float))
+    lat = np.deg2rad(np.asarray(lat, dtype=float))
+    return np.stack(
+        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], axis=-1
+    )
 
 
 # Directions on a face's own lattice, as (dJ, dI) steps.
@@ -544,6 +563,231 @@ class CornerTopology:
         """Every grid edge, as an (n_edges, 2) array of node pairs (lo, hi)."""
         self._build_adjacency()
         return self._edges
+
+    # ------------------------------------------------------------- positions
+
+    def _positions(self):
+        """
+        One geographic position per node: `(node_lon, node_lat, known)`.
+
+        A node that is natively stored takes the position of its canonical
+        representation, so every representation of a corner reports the *same*
+        position however the grid's arrays spell them. A node stored on no face --
+        a cube vertex, or the row a 'left' staggering drops -- is placed at the
+        centroid of the tracer cells that meet there, which is well defined because
+        the cells around a corner are exactly what the node is. Where fewer than
+        three cells survive there is nothing to average and the position is left
+        unknown rather than guessed.
+        """
+        if getattr(self, "_pos_cache", None) is not None:
+            return self._pos_cache
+
+        lon = np.full(self.n_nodes, np.nan)
+        lat = np.full(self.n_nodes, np.nan)
+
+        geo = get_geo_corners(self.grid)
+        cd = self.coords
+        Yq, Xq = cd["Y"]["corner"], cd["X"]["corner"]
+        nat_lon = _faced(geo["X"], (Yq, Xq), self.facedim).astype(float)
+        nat_lat = _faced(geo["Y"], (Yq, Xq), self.facedim).astype(float)
+
+        stored = self.node_is_stored
+        f, j, i = self.node_native[stored].T
+        lon[stored] = nat_lon[f, j, i]
+        lat[stored] = nat_lat[f, j, i]
+
+        missing = np.flatnonzero(~stored)
+        if missing.size:
+            centers = self._cell_centers()
+            if centers is not None:
+                clon, clat = centers
+                for n in missing:
+                    cells = self._cells_around(n)
+                    if len(cells) < 3:
+                        continue
+                    fc, jc, ic = np.array(cells).T
+                    v = _lonlat_to_xyz(clon[fc, jc, ic], clat[fc, jc, ic]).mean(0)
+                    norm = np.linalg.norm(v)
+                    if norm == 0.0:
+                        continue
+                    v = v / norm
+                    lat[n] = np.rad2deg(np.arcsin(np.clip(v[2], -1.0, 1.0)))
+                    lon[n] = np.rad2deg(np.arctan2(v[1], v[0]))
+
+        self._pos_cache = (lon, lat, np.isfinite(lon) & np.isfinite(lat))
+        return self._pos_cache
+
+    @property
+    def node_lon(self):
+        return self._positions()[0]
+
+    @property
+    def node_lat(self):
+        return self._positions()[1]
+
+    @property
+    def node_position_known(self):
+        return self._positions()[2]
+
+    def _cell_centers(self):
+        """Tracer-cell centre coordinates as `(lon, lat)` arrays, or None."""
+        cd = self.coords
+        if cd["X"]["center"] is None or cd["Y"]["center"] is None:
+            return None
+        Yc, Xc = cd["Y"]["center"], cd["X"]["center"]
+        ds = self.grid._ds
+        out = []
+        for axis, want in (("X", "lon"), ("Y", "lat")):
+            hit = [
+                ds.coords[c] for c in ds.coords
+                if want in c.lower() and Xc in ds.coords[c].dims and Yc in ds.coords[c].dims
+            ]
+            if not hit:
+                return None
+            out.append(_faced(hit[0], (Yc, Xc), self.facedim).astype(float))
+        return out[0], out[1]
+
+    def _cells_around(self, node):
+        """
+        The tracer cells that meet at `node`, as `(face, j, i)`.
+
+        Taken as the union over the node's representations, so a corner on a seam
+        collects the cells from both sides without any halo: each representation
+        sees the cells that are in its own face.
+        """
+        cells = set()
+        for f, J, I in self.reps_of(node):
+            for dJ, dI in ((-1, -1), (-1, 0), (0, -1), (0, 0)):
+                jc, ic = J + dJ, I + dI
+                if 0 <= jc < self.Nyc and 0 <= ic < self.Nxc:
+                    cells.add((int(f), int(jc), int(ic)))
+        return sorted(cells)
+
+    # ------------------------------------------------------ edges -> velocities
+
+    def edge_velocities(self, node_a, node_b):
+        """
+        Every native storage of the velocity face between two adjacent corner nodes.
+
+        Each entry is ``(var, face, j, i, to_cell, from_cell)``: the velocity
+        component and its native index, plus the global tracer-cell ids its positive
+        direction points to and from *in its own face's frame*. Reading a face in the
+        frame it is stored in is what lets a rotated or reversed seam be crossed with
+        no vector rotation at all.
+
+        A seam face is usually stored once, on whichever face's low edge it is; a
+        face across a boundary fold can be stored twice; a face on an edge no array
+        covers is stored not at all, and the list is empty.
+        """
+        t, Nyc, Nxc = self.t, self.Nyc, self.Nxc
+        reps_b = {}
+        for f, J, I in self.reps_of(node_b):
+            reps_b.setdefault(int(f), []).append((int(J), int(I)))
+
+        out = []
+        for f, Ja, Ia in self.reps_of(node_a):
+            f, Ja, Ia = int(f), int(Ja), int(Ia)
+            for Jb, Ib in reps_b.get(f, ()):
+                if abs(Ja - Jb) + abs(Ia - Ib) != 1:
+                    continue
+
+                def gid(jc, ic):
+                    if 0 <= jc < Nyc and 0 <= ic < Nxc:
+                        return (f * Nyc + jc) * Nxc + ic
+                    return None
+
+                if Ia == Ib:      # a vertical lattice edge: an X-direction velocity
+                    jc, I = min(Ja, Jb), Ia
+                    i = I - t
+                    if 0 <= i < self.nxq and 0 <= jc < Nyc:
+                        out.append(("U", f, jc, i, gid(jc, I), gid(jc, I - 1)))
+                else:             # a horizontal lattice edge: a Y-direction velocity
+                    J, ic = Ja, min(Ia, Ib)
+                    j = J - t
+                    if 0 <= j < self.nyq and 0 <= ic < Nxc:
+                        out.append(("V", f, j, ic, gid(J, ic), gid(J - 1, ic)))
+        return out
+
+    # ----------------------------------------------------------- native output
+
+    def native_of(self, nodes):
+        """
+        The canonical native `(face, j, i)` of each node.
+
+        Raises where a node is stored on no face: it is a real corner, and a section
+        may legitimately pass through it, but it has no native index and inventing
+        one would put a wrong number into an index array. Callers that can work in
+        node ids should do so.
+        """
+        nodes = np.asarray(nodes)
+        bad = np.flatnonzero(~self.node_is_stored[nodes])
+        if bad.size:
+            n = int(nodes[bad[0]])
+            lon, lat, known = self._positions()
+            where = (
+                f" (near lon={lon[n]:.3f}, lat={lat[n]:.3f})" if known[n] else ""
+            )
+            raise ValueError(
+                f"Corner node {n}{where} is a real grid corner but is stored on no "
+                "face, so it has no native (face, j, i) index. This happens where a "
+                "staggering drops the row an edge falls on, and at junctions such as "
+                "a cubed sphere's un-stored vertices. Work with the section's node "
+                "ids instead of its native indices here."
+            )
+        return self.node_native[nodes]
+
+    def validate_positions(self, tolerance_m=1.0):
+        """
+        Check that the coordinates agree with the topology, without ever letting
+        them decide it.
+
+        Every representation of a node is the same physical corner, so they should
+        carry the same stored position. Where they do not, the grid's metadata and
+        its coordinates disagree -- a declared fold whose corner arrays do not carry
+        the fold, say -- and that is worth reporting loudly, because everything
+        downstream that measures a distance will be wrong even though the topology
+        is right.
+        """
+        geo = get_geo_corners(self.grid)
+        cd = self.coords
+        Yq, Xq = cd["Y"]["corner"], cd["X"]["corner"]
+        nat_lon = _faced(geo["X"], (Yq, Xq), self.facedim).astype(float)
+        nat_lat = _faced(geo["Y"], (Yq, Xq), self.facedim).astype(float)
+
+        t, nyq, nxq = self.t, self.nyq, self.nxq
+        f, J, I = np.meshgrid(
+            np.arange(self.nf), np.arange(self.nqy), np.arange(self.nqx), indexing="ij"
+        )
+        native = (J >= t) & (J < t + nyq) & (I >= t) & (I < t + nxq)
+        xyz = np.full((self.nf, self.nqy, self.nqx, 3), np.nan)
+        fn, Jn, In = f[native], J[native], I[native]
+        xyz[native] = _lonlat_to_xyz(
+            nat_lon[fn, Jn - t, In - t], nat_lat[fn, Jn - t, In - t]
+        )
+
+        lab = self.labels.reshape(self.nf, self.nqy, self.nqx)[native]
+        pts = xyz[native]
+        order = np.argsort(lab, kind="stable")
+        lab, pts = lab[order], pts[order]
+        starts = np.flatnonzero(np.diff(lab)) + 1
+        worst, worst_node = 0.0, -1
+        for lo, hi in zip(np.r_[0, starts], np.r_[starts, lab.size]):
+            if hi - lo < 2:
+                continue
+            block = pts[lo:hi]
+            d = np.linalg.norm(block - block[0], axis=1).max() * 6.371e6
+            if d > worst:
+                worst, worst_node = float(d), int(lab[lo])
+        if worst > tolerance_m:
+            raise ValueError(
+                f"The corner coordinates disagree with the declared topology: node "
+                f"{worst_node} is stored more than once, and its copies are "
+                f"{worst:.3g} m apart. The topology itself is taken from the grid's "
+                "metadata and is unaffected, but distances measured along a section "
+                "through this corner will not be meaningful. Check that the "
+                "coordinates carry the periodicity or fold the grid declares."
+            )
+        return worst
 
 
 def _contiguous_runs(partner):

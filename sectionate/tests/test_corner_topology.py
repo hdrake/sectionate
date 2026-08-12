@@ -242,6 +242,94 @@ def _assert_refines(ct, ot):
         )
 
 
+# ------------------------------------------------------- positions and velocities
+
+
+def test_every_representation_of_a_corner_reports_one_position():
+    """
+    A corner has one position, whichever of its indices you reach it by. That is
+    what makes a distance measured along a section independent of which side of a
+    seam the walk happened to be on.
+    """
+    ct = CornerTopology(_single_tile_grid(6, 4))
+    lon, lat = ct.node_lon, ct.node_lat
+    assert np.isfinite(lon).all() and np.isfinite(lat).all()
+    seam = ct.node_id[0, :, 0]
+    assert np.allclose(lon[seam], lon[ct.node_id[0, :, ct.nqx - 1]])
+
+
+def test_unstored_cube_vertices_are_placed_where_the_cube_puts_them(cube_grid):
+    """
+    A corner stored on no face still has a position, taken from the tracer cells
+    that meet there -- which is exactly what the node *is*, so the estimate is
+    determined by the topology rather than by extrapolating a lattice.
+
+    On a gnomonic cube the answer is analytic: a vertex sits at `(+-1,+-1,+-1)/sqrt(3)`,
+    i.e. at latitude `arcsin(1/sqrt(3))`, and on a 45-degree meridian.
+    """
+    ct = CornerTopology(cube_grid)
+    unstored = np.flatnonzero(~ct.node_is_stored)
+    assert unstored.size == 2
+    vertex_lat = np.rad2deg(np.arcsin(1.0 / np.sqrt(3.0)))
+    for n in unstored:
+        assert len(ct._cells_around(n)) == 3
+        assert ct.node_position_known[n]
+        assert abs(abs(ct.node_lat[n]) - vertex_lat) < 1e-9
+        assert abs((ct.node_lon[n] % 90.0) - 45.0) < 1e-9
+
+
+def test_native_index_of_an_unstored_corner_raises_rather_than_inventing_one(cube_grid):
+    """
+    `-1` is a perfectly good numpy index, so a sentinel in an index array is a trap
+    waiting to select the wrong cell. A corner with no storage has no native index,
+    and saying so is the only safe answer.
+    """
+    ct = CornerTopology(cube_grid)
+    stored = np.flatnonzero(ct.node_is_stored)[:3]
+    assert ct.native_of(stored).shape == (3, 3)
+    unstored = np.flatnonzero(~ct.node_is_stored)
+    with pytest.raises(ValueError, match="stored on no face"):
+        ct.native_of(unstored[:1])
+
+
+def test_edge_velocities_name_the_stored_face_and_the_cells_it_separates(cube_grid):
+    """
+    Every edge of the corner graph is a velocity face, and each is reported in the
+    frame it is stored in -- which is what lets a rotated seam be crossed without
+    rotating any vector.
+    """
+    ct = CornerTopology(cube_grid)
+    for a, b in ct.edges[:200]:
+        vels = ct.edge_velocities(a, b)
+        assert vels, f"edge {a}-{b} of the corner graph has no stored velocity"
+        for var, f, j, i, to_cell, from_cell in vels:
+            assert var in ("U", "V")
+            assert to_cell != from_cell
+    # the relation is symmetric in the two nodes
+    a, b = ct.edges[7]
+    assert ct.edge_velocities(a, b) == ct.edge_velocities(b, a)
+
+
+def test_positions_validate_against_the_topology_without_deciding_it():
+    """
+    Coordinates are allowed to *check* the topology and never to set it. A grid
+    that declares a fold its corner arrays do not carry is resolved correctly all
+    the same -- and is reported, because distances along a section through it will
+    be meaningless.
+    """
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_section_fold import _fold_grid
+
+    if not _xgcm_supports_fold():
+        pytest.skip("requires an xgcm with north-fold padding")
+    ct = CornerTopology(_fold_grid())
+    # the fold is still resolved: the seam row is glued to its own mirror
+    n_pairs = (ct.Nxc - 2) // 2
+    assert ct.n_nodes == (ct.Nyc + 1) * ct.Nxc - n_pairs
+    with pytest.raises(ValueError, match="disagree with the declared topology"):
+        ct.validate_positions()
+
+
 # ------------------------------------------------------------------- real grids
 
 
@@ -296,6 +384,8 @@ def test_llc90_identity_refines_the_coordinate_based_one():
     # `None` are the domain's southern boundary and stay unglued.
     assert len(ct.identifications) == 13 * 4 - 4
     assert (ct.valence <= 4).all()
+    # the coordinates agree with the declared topology exactly
+    assert ct.validate_positions() == 0.0
 
 
 # ----------------------------------------------------------------- performance
