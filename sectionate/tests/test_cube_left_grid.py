@@ -14,7 +14,8 @@ import xarray as xr
 import xgcm
 import pytest
 
-from sectionate.gridutils import outer_topology, corner_position
+from sectionate.gridutils import corner_position
+from sectionate.topology import corner_topology as outer_topology
 from sectionate.section import grid_section
 from sectionate.transports import convergent_transport
 
@@ -203,12 +204,12 @@ def cube_left_grid():
 def test_cube_topology_is_complete_and_consistent():
     """Every cube corner resolves to a coherent node. A 'left'-staggered cube
     stores 6*Nc**2 corners for 6*Nc**2 + 2 physical points, so exactly two cube
-    vertices live on no face: those become edge-less nodes (no native path
-    corner can exist there, so their junction edges are genuine closed
-    boundaries (walls)), their
-    six seam-neighbours lose that one edge, and the six stored vertices are
-    ordinary 3-valent junction nodes -- crossable, unlike under the old
-    junction-walling repair."""
+    vertices live on no face.
+
+    They are still corners: three faces meet there, so they have three neighbours
+    like the other six vertices, and a section may pass through them. What they do
+    not have is a native index, and asking for one says so rather than inventing it.
+    """
     grid, _ = cube_left_grid()
     assert corner_position(grid) == "left"
     ot = outer_topology(grid)
@@ -217,13 +218,13 @@ def test_cube_topology_is_complete_and_consistent():
     native = ot.node_native[:, 0] >= 0
     assert len(deg) == 6 * Nc * Nc + 2
     assert np.count_nonzero(~native) == 2             # the two unstored vertices
-    assert np.array_equal(np.where(~native)[0], np.where(deg == 0)[0])
-    nreps = np.array([len(r) for r in ot.node_reps])
-    stored_vertices = (deg == 3) & (nreps == 3) & native
-    assert np.count_nonzero(stored_vertices) == 6     # 8 cube vertices - 2 unstored
-    # neighbours of the unstored vertices lose exactly the edge into them
-    assert np.count_nonzero((deg == 3) & ~stored_vertices & native) == 6
-    assert np.count_nonzero(deg == 4) == len(deg) - 14
+    assert deg.min() == 3                             # nothing is walled off
+    # all 8 cube vertices are 3-valent, stored or not; everything else is 4-valent
+    assert np.count_nonzero(deg == 3) == 8
+    assert np.count_nonzero(deg == 4) == len(deg) - 8
+    assert np.all(deg[~native] == 3)
+    with pytest.raises(ValueError, match="stored on no face"):
+        ot.native_of(np.where(~native)[0][:1])
 
 
 def _coordinate_jittered_cube_left_grid(eps=2.0):
@@ -562,10 +563,14 @@ def test_open_wall_padded_transports_zeroes_walls_and_reads_seam_twin():
     assert np.any(Vo[0, Nc, :] != 0.0)             # genuinely nonzero
 
 
-def test_same_side_reverse_gluing_raises():
-    """A same-side (`reverse=True`) gluing leaves a whole seam line of corners
-    stored on no face (degenerate on a staggered grid); `outer_topology` must
-    raise an error rather than return an invalid topology."""
+def test_same_side_reverse_gluing_leaves_corners_unstored_but_resolved():
+    """A same-side (`reverse=True`) gluing on a staggered grid meets along the edge
+    the staggering drops, so a whole seam line of corners is stored on no face.
+
+    That is a fact about the data, not a reason to refuse the grid: the corners are
+    resolved like any others and can be walked through, and it is only asking for
+    their native index that has no answer. The corner count still closes on the
+    polyhedron, which is what says the topology is right."""
     import itertools
 
     def has_same_side_gluing(rots):
@@ -579,8 +584,12 @@ def test_same_side_reverse_gluing_raises():
     same_side = next(r for r in itertools.product(range(4), repeat=6)
                      if has_same_side_gluing(r))
     grid, _ = _cube_variant(same_side, stagger="left")
-    with pytest.raises((NotImplementedError, ValueError)):
-        outer_topology(grid)
+    ot = outer_topology(grid)
+    assert ot.n_nodes == 6 * Nc * Nc + 2
+    unstored = np.where(ot.node_native[:, 0] < 0)[0]
+    assert unstored.size > 0                          # the dropped seam line
+    with pytest.raises(ValueError, match="stored on no face"):
+        ot.native_of(unstored[:1])
 
 
 def test_outer_reverse_gluing_matches_by_coincidence():

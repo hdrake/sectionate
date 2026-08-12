@@ -4,7 +4,7 @@ import xarray as xr
 import dask
 
 from .gridutils import (
-    corner_offset, coord_dict, get_geo_corners, get_facedim, outer_topology,
+    corner_offset, coord_dict, get_geo_corners, get_facedim,
 )
 from .section import distance_on_unit_sphere, COINCIDENT_TOLERANCE_M
 

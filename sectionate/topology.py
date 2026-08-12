@@ -480,7 +480,7 @@ class CornerTopology:
     # ------------------------------------------------------------ derived data
 
     @property
-    def node_reps(self):
+    def _reps_csr(self):
         """CSR-style `(offsets, slots)` listing every slot of each node."""
         if getattr(self, "_reps", None) is None:
             order = np.argsort(self.labels, kind="stable")
@@ -490,9 +490,29 @@ class CornerTopology:
 
     def reps_of(self, node):
         """The `(face, J, I)` slots of `node`, as an (n, 3) array."""
-        offsets, order = self.node_reps
+        offsets, order = self._reps_csr
         s = order[offsets[node]:offsets[node + 1]]
         return np.stack(self.unslot(s), -1)
+
+    @property
+    def node_reps(self):
+        """Every slot of every node, as a list of `(face, J, I)` tuples per node."""
+        if getattr(self, "_reps_list", None) is None:
+            self._reps_list = [
+                [tuple(int(x) for x in slot) for slot in self.reps_of(n)]
+                for n in range(self.n_nodes)
+            ]
+        return self._reps_list
+
+    @property
+    def node_adj(self):
+        """The neighbouring nodes of each node, as a list of sets."""
+        if getattr(self, "_adj_sets", None) is None:
+            self._build_adjacency()
+            self._adj_sets = [
+                set(int(m) for m in self.neighbors(n)) for n in range(self.n_nodes)
+            ]
+        return self._adj_sets
 
     @property
     def valence(self):
@@ -775,6 +795,108 @@ class CornerTopology:
                     break
         self._handed = handed
         return handed
+
+    def cells_of_edge(self, node_a, node_b):
+        """The (up to two) tracer cells an edge separates, as global ids."""
+        shared = set(self._cells_around(node_a)) & set(self._cells_around(node_b))
+        return {(f * self.Nyc + j) * self.Nxc + i for f, j, i in shared}
+
+    def padded_transports(self, u, v):
+        """
+        Extend native staggered transports onto the full 'outer' lattice.
+
+        A staggered grid stores one velocity face once, so a face's own arrays stop
+        short of two of its edges; the values are not missing, they are held by
+        whichever face does store them. Each slot the native arrays do not cover is
+        therefore filled by asking the corner graph which physical edge it is and
+        reading that edge's stored value, re-signed for the receiving face's own axis
+        direction.
+
+        Nothing is rotated: every value is read in the frame it was written in, so
+        there is no chance of getting wrong how a rotated or reversed seam maps `u`
+        onto `v`. And it takes plain arrays rather than a `{axis: component}` mapping.
+
+        An edge stored on *no* face -- an open wall, or a junction a staggering
+        leaves out, such as a cubed sphere's un-stored vertices -- is filled with
+        0.0. For a wall that is the true transport. For an un-stored junction the
+        edge exists but nothing holds its value, so 0.0 is the conservative choice
+        rather than a truth: it keeps cell convergence exactly conservative and
+        confines the unknown flux to those edges, where a halo pad would spread its
+        `fill_value` through the sum instead.
+
+        Parameters
+        ----------
+        u, v : xr.DataArray or np.ndarray
+            Native X- and Y-direction transports, dims ``([face,] Y, X)`` with X/Y at
+            (corner, center) for `u` and (center, corner) for `v`.
+
+        Returns
+        -------
+        (Uo, Vo) : np.ndarray
+            Shapes ``(nf, Nyc, Nxc + 1)`` and ``(nf, Nyc + 1, Nxc)``.
+        """
+        nf, Nyc, Nxc, t = self.nf, self.Nyc, self.Nxc, self.t
+        U = np.nan_to_num(np.asarray(getattr(u, "values", u), dtype=float))
+        V = np.nan_to_num(np.asarray(getattr(v, "values", v), dtype=float))
+        if self.single_tile:
+            U, V = U[None, ...], V[None, ...]
+
+        def gid(f, j, i):
+            return (f * Nyc + j) * Nxc + i if (0 <= j < Nyc and 0 <= i < Nxc) else None
+
+        def value(nA, nB, want_to, want_from):
+            """
+            That physical edge's stored transport, signed for this slot.
+
+            The two are compared by which tracer cell each points *at*. Only one side
+            need be identifiable: an edge separates exactly two cells, so agreeing on
+            one of them fixes the direction. That matters here, because the face that
+            stores a seam edge names only the cell on its own side -- the other lies
+            on the face we are filling, which its frame cannot see.
+            """
+            for var, f2, j2, i2, to_cell, from_cell, _step, _slots in (
+                self.edge_velocities(nA, nB)
+            ):
+                val = float((U if var == "U" else V)[f2, j2, i2])
+                for stored, sign in ((to_cell, 1.0), (from_cell, -1.0)):
+                    if stored is None:
+                        continue
+                    if stored == want_to:
+                        return sign * val
+                    if stored == want_from:
+                        return -sign * val
+            return 0.0
+
+        Uo = np.zeros((nf, Nyc, Nxc + 1))
+        Uo[:, :, t:t + self.nxq] = U
+        Vo = np.zeros((nf, Nyc + 1, Nxc))
+        Vo[:, t:t + self.nyq, :] = V
+
+        for f in range(nf):
+            for I in (I for I in (0, Nxc) if not (t <= I < t + self.nxq)):
+                for jc in range(Nyc):
+                    nA = int(self.node_id[f, jc, I])
+                    nB = int(self.node_id[f, jc + 1, I])
+                    # `+x` points from the cell on the slot's low side to the high
+                    own = gid(f, jc, I if I == 0 else I - 1)
+                    other = (self.cells_of_edge(nA, nB) - {own} - {None})
+                    other = next(iter(other)) if other else None
+                    Uo[f, jc, I] = (
+                        value(nA, nB, own, other) if I == 0
+                        else value(nA, nB, other, own)
+                    )
+            for J in (J for J in (0, Nyc) if not (t <= J < t + self.nyq)):
+                for ic in range(Nxc):
+                    nA = int(self.node_id[f, J, ic])
+                    nB = int(self.node_id[f, J, ic + 1])
+                    own = gid(f, J if J == 0 else J - 1, ic)
+                    other = (self.cells_of_edge(nA, nB) - {own} - {None})
+                    other = next(iter(other)) if other else None
+                    Vo[f, J, ic] = (
+                        value(nA, nB, own, other) if J == 0
+                        else value(nA, nB, other, own)
+                    )
+        return Uo, Vo
 
     # ----------------------------------------------------------- native output
 

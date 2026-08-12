@@ -20,7 +20,7 @@ import xarray as xr
 import xgcm
 
 from sectionate.topology import CornerTopology, Identification
-from sectionate.gridutils import outer_topology
+from sectionate.topology import corner_topology as outer_topology
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
