@@ -1,0 +1,413 @@
+"""
+Corner identity is decided by the grid's declared topology, never by coordinates.
+
+Every expectation here is derived from what the grid *declares*, independently of
+how `sectionate` happens to compute it: a periodic axis of `Nxc` cells has `Nxc`
+distinct corner columns whatever `Nxc` is; a corner-pivot fold glues its seam row to
+its own mirror, which pairs all but the two fixed points; a cubed sphere has
+`6N^2 + 2` corner points. Where an expectation cannot be derived that way it is
+stated as an invariant (a refinement relation, a valence that matches the cells
+actually meeting at a point) rather than as a recorded number.
+"""
+
+import os
+import sys
+import time
+
+import numpy as np
+import pytest
+import xarray as xr
+import xgcm
+
+from sectionate.topology import CornerTopology, Identification
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _single_tile_grid(nx, ny, x_padding="periodic", y_padding="fill"):
+    """A minimal 'outer' single-tile grid with the requested axis topology."""
+    xq = np.arange(nx + 1, dtype=float) * (360.0 / nx)
+    yq = np.linspace(-40.0, 40.0, ny + 1)
+    xh = 0.5 * (xq[:-1] + xq[1:])
+    yh = 0.5 * (yq[:-1] + yq[1:])
+    lon_c, lat_c = np.meshgrid(xq, yq)
+    lon, lat = np.meshgrid(xh, yh)
+    ds = xr.Dataset(
+        coords={
+            "xh": xh, "yh": yh, "xq": xq, "yq": yq,
+            "geolon": (("yh", "xh"), lon), "geolat": (("yh", "xh"), lat),
+            "geolon_c": (("yq", "xq"), lon_c), "geolat_c": (("yq", "xq"), lat_c),
+        }
+    )
+    return xgcm.Grid(
+        ds,
+        coords={"X": {"center": "xh", "outer": "xq"},
+                "Y": {"center": "yh", "outer": "yq"}},
+        padding={"X": x_padding, "Y": y_padding},
+        autoparse_metadata=False,
+    )
+
+
+# --------------------------------------------------------------------- the axis
+
+
+@pytest.mark.parametrize("nx", [1, 2, 3, 4, 5, 8, 17])
+def test_periodic_axis_of_any_width_has_one_corner_column_per_cell(nx):
+    """
+    A periodic axis identifies its first and last corner column and nothing else,
+    so `Nxc` cells leave exactly `Nxc` distinct corner columns -- for every width.
+
+    Narrow axes are the point. Deciding identity from the ring of tracer cells around
+    a corner cannot get this right: on a 2-cell-wide periodic axis all three corner
+    columns of a row are surrounded by the same two cells, so a cell-set test merges
+    corners that the grid says are distinct.
+    """
+    ny = 4
+    ct = CornerTopology(_single_tile_grid(nx, ny))
+    assert ct.n_nodes == (ny + 1) * nx
+    # the wrap itself, and only the wrap
+    assert (ct.node_id[0, :, 0] == ct.node_id[0, :, nx]).all()
+    interior = ct.node_id[0, :, :nx]
+    assert len(np.unique(interior)) == interior.size
+
+
+def test_a_wall_row_still_identifies_its_periodic_twins():
+    """
+    Periodicity is a property of the axis, so it holds on the boundary rows too.
+
+    A corner on a walled edge touches only two tracer cells, and two cells share an
+    edge rather than meeting at a point -- so nothing about the cells around it can
+    reveal that the row's two ends are the same corner. The declaration can.
+    """
+    ct = CornerTopology(_single_tile_grid(6, 4, y_padding="fill"))
+    for row in (0, ct.nqy - 1):
+        assert ct.node_id[0, row, 0] == ct.node_id[0, row, ct.nqx - 1]
+        assert len(np.unique(ct.node_id[0, row, :])) == ct.Nxc
+
+
+def test_a_walled_axis_identifies_nothing():
+    ct = CornerTopology(_single_tile_grid(6, 4, x_padding="fill"))
+    assert ct.n_nodes == ct.n_slots
+
+
+def test_doubly_periodic_grid():
+    nx, ny = 5, 4
+    ct = CornerTopology(_single_tile_grid(nx, ny, "periodic", "periodic"))
+    assert ct.n_nodes == nx * ny
+
+
+# --------------------------------------------------------------------- the fold
+
+
+def _xgcm_supports_fold():
+    try:
+        from xgcm.padding import _is_fold_padding  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+fold_only = pytest.mark.skipif(
+    not _xgcm_supports_fold(), reason="requires an xgcm with north-fold padding"
+)
+
+
+@fold_only
+@pytest.mark.parametrize("nx", [4, 6, 8, 12])
+def test_corner_pivot_fold_pairs_its_seam_row_about_two_fixed_points(nx):
+    """
+    A corner-pivot fold glues the seam row to itself by `I -> -I (mod Nxc)`.
+
+    That map has exactly two fixed points -- the two poles of the bipolar cap, at
+    `I = 0` and `I = Nxc/2` for even `Nxc` -- and pairs off everything else. So the
+    seam row keeps `Nxc/2 + 1` distinct corners out of `Nxc`, and the node count
+    falls by the number of pairs.
+    """
+    ny = 4
+    grid = _single_tile_grid(nx, ny, "periodic", {"fold": "corner"})
+    ct = CornerTopology(grid)
+    n_pairs = (nx - 2) // 2
+    assert ct.n_nodes == (ny + 1) * nx - n_pairs
+    seam = ct.node_id[0, ct.nqy - 1, :nx]
+    assert len(np.unique(seam)) == nx // 2 + 1
+    # the two fixed points really are fixed
+    assert seam[0] == ct.node_id[0, ct.nqy - 1, 0]
+    assert len(np.unique([seam[i] for i in (0, nx // 2)])) == 2
+
+
+@fold_only
+def test_fold_identity_ignores_the_corner_coordinates():
+    """
+    Identity comes from the declaration, so corrupting the coordinates cannot move
+    it. This is the property the whole design turns on: a grid whose stored corner
+    positions do not carry the fold symmetry it declares is still resolved correctly.
+    """
+    grid = _single_tile_grid(8, 4, "periodic", {"fold": "corner"})
+    ref = CornerTopology(grid).node_id.copy()
+    rng = np.random.default_rng(0)
+    ds = grid._ds.copy(deep=True)
+    ds["geolon_c"] = ds["geolon_c"] + rng.normal(0.0, 2.0, ds["geolon_c"].shape)
+    ds["geolat_c"] = ds["geolat_c"] + rng.normal(0.0, 2.0, ds["geolat_c"].shape)
+    jittered = xgcm.Grid(
+        ds,
+        coords={"X": {"center": "xh", "outer": "xq"},
+                "Y": {"center": "yh", "outer": "yq"}},
+        padding={"X": "periodic", "Y": {"fold": "corner"}},
+        autoparse_metadata=False,
+    )
+    assert (CornerTopology(jittered).node_id == ref).all()
+
+
+# ------------------------------------------------------- explicit declarations
+
+
+def test_explicit_identification_merges_what_it_names():
+    """
+    Topology a grid's own metadata cannot express is still an ordinary affine map,
+    and can be declared directly -- which is how a lat-lon-cap grid's southern
+    boundary fold, glued to several partners over different index ranges, is stated.
+    """
+    grid = _single_tile_grid(6, 4, x_padding="fill")
+    plain = CornerTopology(grid)
+    J = np.arange(plain.nqy)
+    ident = Identification(
+        np.stack([np.zeros_like(J), J, np.zeros_like(J)], -1),
+        np.stack([np.zeros_like(J), J, np.full_like(J, plain.nqx - 1)], -1),
+        name="hand-declared wrap",
+    )
+    ct = CornerTopology(grid, identifications=[ident])
+    assert ct.n_nodes == plain.n_nodes - plain.nqy
+    assert (ct.node_id[0, :, 0] == ct.node_id[0, :, ct.nqx - 1]).all()
+
+
+def test_identification_outside_the_lattice_raises():
+    grid = _single_tile_grid(6, 4)
+    bad = Identification([[0, 0, 0]], [[0, 0, 999]], name="nonsense")
+    with pytest.raises(ValueError, match="outside this grid"):
+        CornerTopology(grid, identifications=[bad])
+
+
+def test_identification_length_mismatch_raises():
+    with pytest.raises(ValueError, match="same length"):
+        Identification([[0, 0, 0], [0, 0, 1]], [[0, 0, 2]], name="ragged")
+
+
+# ------------------------------------------------------------------ multi-tile
+
+
+@pytest.fixture(scope="module")
+def cube_grid():
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_cube_left_grid import cube_left_grid
+    grid, _psi = cube_left_grid()
+    return grid
+
+
+def test_cubed_sphere_has_the_corner_count_euler_demands(cube_grid):
+    """
+    A cubed sphere of `N x N` cells per face has `6N^2 + 2` distinct corner points:
+    `6N^2` of degree 4 and the 8 cube vertices of degree 3. That count follows from
+    the polyhedron, not from any implementation.
+    """
+    ct = CornerTopology(cube_grid)
+    N = ct.Nxc
+    assert ct.n_nodes == 6 * N * N + 2
+    v = ct.valence
+    assert (np.unique(v) <= 4).all()
+    assert int((v == 3).sum()) == 8
+
+
+
+
+
+# ------------------------------------------------------- positions and velocities
+
+
+def test_every_representation_of_a_corner_reports_one_position():
+    """
+    A corner has one position, whichever of its indices you reach it by. That is
+    what makes a distance measured along a section independent of which side of a
+    seam the walk happened to be on.
+    """
+    ct = CornerTopology(_single_tile_grid(6, 4))
+    lon, lat = ct.node_lon, ct.node_lat
+    assert np.isfinite(lon).all() and np.isfinite(lat).all()
+    seam = ct.node_id[0, :, 0]
+    assert np.allclose(lon[seam], lon[ct.node_id[0, :, ct.nqx - 1]])
+
+
+def test_unstored_cube_vertices_are_placed_where_the_cube_puts_them(cube_grid):
+    """
+    A corner stored on no face still has a position, taken from the tracer cells
+    that meet there -- which is exactly what the node *is*, so the estimate is
+    determined by the topology rather than by extrapolating a lattice.
+
+    On a gnomonic cube the answer is analytic: a vertex sits at `(+-1,+-1,+-1)/sqrt(3)`,
+    i.e. at latitude `arcsin(1/sqrt(3))`, and on a 45-degree meridian.
+    """
+    ct = CornerTopology(cube_grid)
+    unstored = np.flatnonzero(~ct.node_is_stored)
+    assert unstored.size == 2
+    vertex_lat = np.rad2deg(np.arcsin(1.0 / np.sqrt(3.0)))
+    for n in unstored:
+        assert len(ct._cells_around(n)) == 3
+        assert ct.node_position_known[n]
+        assert abs(abs(ct.node_lat[n]) - vertex_lat) < 1e-9
+        assert abs((ct.node_lon[n] % 90.0) - 45.0) < 1e-9
+
+
+def test_native_index_of_an_unstored_corner_raises_rather_than_inventing_one(cube_grid):
+    """
+    `-1` is a perfectly good numpy index, so a sentinel in an index array is a trap
+    waiting to select the wrong cell. A corner with no storage has no native index,
+    and saying so is the only safe answer.
+    """
+    ct = CornerTopology(cube_grid)
+    stored = np.flatnonzero(ct.node_is_stored)[:3]
+    assert ct.native_of(stored).shape == (3, 3)
+    unstored = np.flatnonzero(~ct.node_is_stored)
+    with pytest.raises(ValueError, match="stores it on no face"):
+        ct.native_of(unstored[:1])
+
+
+def test_edge_velocities_name_the_stored_face_and_the_cells_it_separates(cube_grid):
+    """
+    Every edge of the corner graph is a velocity face, and each is reported in the
+    frame it is stored in -- which is what lets a rotated seam be crossed without
+    rotating any vector.
+    """
+    ct = CornerTopology(cube_grid)
+    for a, b in ct.edges[:200]:
+        vels = ct.edge_velocities(a, b)
+        assert vels, f"edge {a}-{b} of the corner graph has no stored velocity"
+        for var, f, j, i, to_cell, from_cell, step, slots in vels:
+            assert var in ("U", "V")
+            assert to_cell != from_cell
+            assert abs(step[0]) + abs(step[1]) == 1
+
+    # The same face either way round, but the step through it reverses -- which is
+    # what carries the sign, so the two must not be conflated.
+    a, b = (int(x) for x in ct.edges[7])
+    fwd, back = ct.edge_velocities(a, b), ct.edge_velocities(b, a)
+    assert [v[:6] for v in fwd] == [v[:6] for v in back]
+    assert [v[6] for v in fwd] == [(-dJ, -dI) for dJ, dI in (v[6] for v in back)]
+
+
+def test_positions_validate_against_the_topology_without_deciding_it():
+    """
+    Coordinates are allowed to *check* the topology and never to set it. A grid
+    that declares a fold its corner arrays do not carry is resolved correctly all
+    the same -- and is reported, because distances along a section through it will
+    be meaningless.
+    """
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_section_fold import _fold_grid
+
+    if not _xgcm_supports_fold():
+        pytest.skip("requires an xgcm with north-fold padding")
+    ct = CornerTopology(_fold_grid())
+    # the fold is still resolved: the seam row is glued to its own mirror
+    n_pairs = (ct.Nxc - 2) // 2
+    assert ct.n_nodes == (ct.Nyc + 1) * ct.Nxc - n_pairs
+    with pytest.raises(ValueError, match="disagree with the declared topology"):
+        ct.validate_positions()
+
+
+# ------------------------------------------------------------------- real grids
+
+
+_DATA = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+_MOM6 = os.path.join(_DATA, "MOM6_global_example_sigma2_budgets_v0_0_6.nc")
+_ECCO = os.path.join(_DATA, "GRID_GEOMETRY_ECCO_V4r4_native_llc0090.nc")
+
+
+@fold_only
+@pytest.mark.skipif(not os.path.exists(_MOM6), reason="needs the MOM6 example grid")
+def test_real_tripolar_grid_matches_its_declaration():
+    ds = xr.open_dataset(_MOM6)
+    grid = xgcm.Grid(
+        ds,
+        coords={"X": {"center": "xh", "outer": "xq"},
+                "Y": {"center": "yh", "outer": "yq"}},
+        padding={"X": "periodic", "Y": {"fold": "corner"}},
+        autoparse_metadata=False,
+    )
+    ct = CornerTopology(grid)
+    n_pairs = (ct.Nxc - 2) // 2
+    assert ct.n_nodes == (ct.Nyc + 1) * ct.Nxc - n_pairs
+
+    # The southern edge is a wall, so its corners have three edges each; every
+    # interior corner has four; the two fold pivots have two.
+    counts = dict(zip(*[c.tolist() for c in np.unique(ct.valence, return_counts=True)]))
+    assert counts[3] == ct.Nxc          # the walled southern row
+    assert counts[2] == 2               # the two poles of the bipolar cap
+    assert max(counts) == 4
+
+    # Geographically coincident corners stay distinct where the grid says they are.
+    # The bipolar cap's singular meridian stores one position for a whole column of
+    # corners; each is still its own node, so a section through the cap knows which
+    # of the fan's sectors it passed between.
+    lon = ds["geolon_c"].values
+    lat = ds["geolat_c"].values
+    col = ct.node_id[0, 140:181, 0]
+    assert len(np.unique(col)) == col.size
+    assert np.allclose(lon[140:181, 0], lon[140, 0])
+    assert np.allclose(lat[140:181, 0], lat[140, 0])
+
+
+@pytest.mark.skipif(not os.path.exists(_ECCO), reason="needs the ECCO LLC90 grid")
+def test_llc90_resolves_to_the_corner_count_its_seams_imply():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "examples"))
+    from load_example_ECCO_grid import load_ECCO_LLC90_grid
+    from sectionate.topology import corner_topology
+
+    grid = load_ECCO_LLC90_grid()
+    # What the grid's own `face_connections` say, and what the loader adds on top.
+    # LLC90 stores 13 x 90 x 90 cells, so its 'outer' lattice holds 13 x 91 x 91
+    # corner slots.
+    plain = CornerTopology(grid)
+    assert plain.n_slots == 13 * 91 * 91
+    assert plain.n_nodes == 105481
+    assert int(np.count_nonzero(~plain.node_is_stored)) == 181
+
+    # The southern boundary folds onto itself along the 65E/115W great circle, which
+    # `face_connections` declares as four walls because its schema cannot describe an
+    # edge glued to several partners over different index ranges. Declaring it merges
+    # 179 further corner pairs -- and every one of them is bit-identically coincident
+    # in the archived coordinates, which is a check on the declaration, not its source.
+    ct = corner_topology(grid)          # the loader's, with the fold declared
+    assert ct.n_nodes == 105302
+    assert int(np.count_nonzero(~ct.node_is_stored)) == 78
+    assert ct.validate_positions() == 0.0
+    # every tile edge that `face_connections` names is resolved; the four it leaves
+    # `None` are the domain's southern boundary, which the loader declares separately
+    assert len(plain.identifications) == 13 * 4 - 4
+    assert len(ct.identifications) == 13 * 4 - 4 + 5
+    assert (ct.valence <= 4).all()
+    # the coordinates agree with the declared topology exactly
+    assert ct.validate_positions() == 0.0
+
+
+# ----------------------------------------------------------------- performance
+
+
+@pytest.mark.slow
+def test_topology_build_scales_to_production_resolution():
+    """
+    The corner topology is built for every grid on every section, so it has to be
+    affordable at the resolutions people actually run. Identity is O(seam) and
+    labelling O(cells), both vectorized, so the cost is linear in corner count.
+    """
+    def build(nx, ny):
+        grid = _single_tile_grid(nx, ny)
+        t0 = time.perf_counter()
+        ct = CornerTopology(grid)
+        ct.valence
+        return time.perf_counter() - t0, ct.n_slots
+
+    t_small, n_small = build(360, 270)          # ~1e5 slots
+    t_big, n_big = build(1440, 1080)            # ~1.6e6 slots, a quarter degree
+
+    assert t_big < 15.0, f"a quarter-degree grid took {t_big:.1f}s to resolve"
+    # linear, not quadratic: 16x the slots must not cost anywhere near 16^2 the time
+    assert t_big / max(t_small, 1e-3) < 60.0

@@ -31,7 +31,7 @@ def test_open_grid_section():
     from sectionate.section import grid_section
     lonseg = np.array([0., 120, 120, 0])
     latseg = np.array([-80., -80, 0, 0])
-    i, j, lons, lats = grid_section(grid, lonseg, latseg)
+    i, j, _f, lons, lats = grid_section(grid, lonseg, latseg)
     assert np.all([
         modequal(i, np.array([0, 1, 2, 2, 2, 1, 0])),
         modequal(j, np.array([0, 0, 0, 1, 2, 2, 2])),
@@ -43,7 +43,7 @@ def test_closed_grid_section():
     from sectionate.section import grid_section
     lonseg = np.array([0., 120, 120, 0, 0])
     latseg = np.array([-80., -80, 0, 0, -80.])
-    i, j, lons, lats = grid_section(grid, lonseg, latseg)
+    i, j, _f, lons, lats = grid_section(grid, lonseg, latseg)
     assert np.all([
         modequal(i, np.array([0, 1, 2, 2, 2, 1, 0, 0, 0])),
         modequal(j, np.array([0, 0, 0, 1, 2, 2, 2, 1, 0])),
@@ -55,7 +55,7 @@ def test_periodic_grid_section():
     from sectionate.section import grid_section
     lonseg = np.array([300, 60])
     latseg = np.array([0, 0])
-    i, j, lons, lats = grid_section(grid, lonseg, latseg)
+    i, j, _f, lons, lats = grid_section(grid, lonseg, latseg)
     # The seam vertex (360 == 0) is symmetric+periodic, so it carries two indices (6 and 0):
     # the path steps through both, leaving a doubled corner. The zero-length edge between
     # them carries no flux and is dropped when faces are derived (see uvindices_from_qindices).
@@ -80,7 +80,7 @@ def test_latitude_circle_zero_length_closure():
     # full latitude circle rather than raising.
     lonseg = np.array([0., 120., 240., 360., 0.])
     latseg = np.array([0., 0., 0., 0., 0.])
-    i, j, lons, lats = grid_section(grid, lonseg, latseg, curve="latitude circle")
+    i, j, _f, lons, lats = grid_section(grid, lonseg, latseg, curve="latitude circle")
     assert np.all([
         modequal(i, np.array([0, 1, 2, 3, 4, 5, 6])),
         modequal(lons, np.array([0., 60., 120., 180., 240., 300., 360.])),
@@ -97,20 +97,25 @@ def test_latitude_circle_takes_shortest_path_west():
     # Unit level: a raw 270-degree change is a 90-degree westward one; not an error.
     _check_segment_span(0., 0., 270., 0., "latitude circle")
 
-    # End to end: 0 -> 270 leaves lon=0 westward across the periodic seam (the seam
-    # vertex carries both index 6 (lon 360) and index 0 (lon 0)); the endpoint snaps to
-    # the nearest corner at lon=240. The path never visits the eastern half.
-    i, j, lons, lats = grid_section(grid, [0., 270.], [0., 0.], curve="latitude circle")
+    # End to end: 0 -> 270 leaves lon=0 westward across the periodic seam; the endpoint
+    # snaps to the nearest corner at lon=240. The path never visits the eastern half.
+    #
+    # The seam vertex is one corner with two spellings, index 6 (lon 360) and index 0
+    # (lon 0). The section *starts* on it, so it is written in whichever spelling the
+    # first step leaves from -- index 6, heading west. Both spellings appear only where
+    # the walk crosses the seam mid-path and has to hand off between the two frames; at
+    # the start there is no frame to hand off from, so the corner is emitted once.
+    i, j, _f, lons, lats = grid_section(grid, [0., 270.], [0., 0.], curve="latitude circle")
     assert np.all([
-        modequal(i, np.array([0, 6, 5, 4])),
-        modequal(j, np.array([2, 2, 2, 2])),
-        modequal(lons, np.array([0., 360., 300., 240.])),
-        modequal(lats, np.array([0., 0., 0., 0.])),
+        modequal(i, np.array([6, 5, 4])),
+        modequal(j, np.array([2, 2, 2])),
+        modequal(lons, np.array([360., 300., 240.])),
+        modequal(lats, np.array([0., 0., 0.])),
     ])
     assert not np.any(np.isin(np.mod(lons, 360.), [60., 120., 180.]))
 
     # The default great circle already behaved this way; both curves now agree.
-    i_gc, j_gc, lons_gc, lats_gc = grid_section(grid, [0., 270.], [0., 0.])
+    i_gc, j_gc, _f, lons_gc, lats_gc = grid_section(grid, [0., 270.], [0., 0.])
     assert np.all([modequal(i_gc, i), modequal(j_gc, j)])
 
 
@@ -193,7 +198,7 @@ def test_latitude_and_great_circle_chooses_per_segment():
     assert _check_segment_span(0., 0., 120., 40., combined) == "great circle"
 
     # A meridional segment walks straight down the meridian.
-    i, j, lons, lats = grid_section(grid, [60., 60.], [-80., 80.], curve=combined)
+    i, j, _f, lons, lats = grid_section(grid, [60., 60.], [-80., 80.], curve=combined)
     assert np.all([
         modequal(i, np.array([1, 1, 1, 1, 1])),
         modequal(j, np.array([0, 1, 2, 3, 4])),
@@ -214,7 +219,7 @@ def test_latitude_and_great_circle_chooses_per_segment():
     ])
 
     # And a section mixing the two kinds of leg is traced end to end.
-    i, j, lons, lats = grid_section(grid, [0., 120., 120.], [0., 0., 40.], curve=combined)
+    i, j, _f, lons, lats = grid_section(grid, [0., 120., 120.], [0., 0., 40.], curve=combined)
     assert np.all([
         modequal(lons, np.array([0., 60., 120., 120.])),
         modequal(lats, np.array([0., 0., 0., 40.])),
@@ -253,26 +258,35 @@ def _fine_global_grid(dlon=2., dlat=2.):
 def test_parallel_is_held_where_the_geodesic_bows():
     """The test that actually separates the two metrics. Between (0, 40N) and (120, 40N)
     the geodesic bows a long way poleward -- it is the shorter path -- while the parallel
-    does not. On a 2-degree grid the constant-latitude walk holds lat 40 for all 61 of its
-    points; the great-circle walk climbs to 60N and takes 83."""
+    does not. On a 2-degree grid the constant-latitude walk holds lat 40 the whole way;
+    the great-circle walk climbs to 60N and pays for it in extra steps."""
     from sectionate.section import grid_section
 
     fine = _fine_global_grid()
 
-    i, j, lons, lats = grid_section(fine, [0., 120.], [40., 40.], curve="latitude circle")
+    i, j, _f, lons, lats = grid_section(fine, [0., 120.], [40., 40.], curve="latitude circle")
     assert np.all(lats == 40.)
-    assert len(i) == 61
+    assert len(i) == 61                         # 120 degrees at 2 degrees a cell
     assert np.array_equal(lons, np.arange(0., 122., 2.))
 
-    i_gc, j_gc, lons_gc, lats_gc = grid_section(fine, [0., 120.], [40., 40.])
+    i_gc, j_gc, _f_gc, lons_gc, lats_gc = grid_section(fine, [0., 120.], [40., 40.])
     assert lats_gc.max() == 60.                 # bows ~20 degrees poleward
-    assert len(i_gc) == 83
+
+    # Both walks take the fewest steps their route allows: one cell at a time, never
+    # diagonally and never doubling back, so the step count is exactly the distance
+    # covered in cells. For the geodesic that is 60 zonally plus 10 up and 10 back
+    # down again.
+    for idx, jdx in ((i, j), (i_gc, j_gc)):
+        di, dj = np.abs(np.diff(idx)), np.abs(np.diff(jdx))
+        assert np.all(di + dj == 1)             # one axis, one cell, every step
+        assert len(idx) - 1 == di.sum() + dj.sum()
+    assert len(i_gc) - 1 == 60 + 2 * (60 - 40) // 2
 
     # The combined option classifies this segment as constant-latitude, so it must
     # reproduce the parallel exactly, not the geodesic.
     combined = grid_section(fine, [0., 120.], [40., 40.],
                             curve="latitude and great circle")
-    assert np.all([np.array_equal(a, b) for a, b in zip(combined, (i, j, lons, lats))])
+    assert np.all([np.array_equal(a, b) for a, b in zip(combined, (i, j, _f, lons, lats))])
 
 
 def test_float32_waypoints_still_count_as_constant_latitude():
@@ -295,6 +309,6 @@ def test_float32_waypoints_still_count_as_constant_latitude():
 
     # End to end: both waypoints snap to the same corner row and the path holds it.
     fine = _fine_global_grid()
-    i, j, lons, lats = grid_section(fine, [0., 120.], [lat32, 26.4], curve="latitude circle")
+    i, j, _f, lons, lats = grid_section(fine, [0., 120.], [lat32, 26.4], curve="latitude circle")
     assert np.all(lats == lats[0])
     assert len(i) == 61

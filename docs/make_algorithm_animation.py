@@ -12,7 +12,7 @@ of which are committed -- Read the Docs never executes anything, so the artifact
 must already exist at build time.
 
 The walk is *not* reimplemented here. ``replay_walk`` mirrors the loop in
-``sectionate.section.infer_grid_path`` step by step so that the intermediate
+``sectionate.walk.infer_grid_path`` step by step so that the intermediate
 state (which neighbors exist, which are admitted, what each one's metrics are)
 can be recorded for drawing, but every number it computes comes from the
 package's own helpers, and ``main`` asserts that the replayed path is identical
@@ -37,12 +37,12 @@ from matplotlib.collections import LineCollection
 from matplotlib.animation import FFMpegWriter
 
 from sectionate import grid_section
-from sectionate.gridutils import get_geo_corners, build_neighbor_maps
+from sectionate.gridutils import get_geo_corners
+from sectionate.topology import corner_topology
+from sectionate.walk import find_closest_corner, native_path
 from sectionate.section import (
-    COINCIDENT_TOLERANCE_M,
     WALK_DEVIATION_ATOL,
     distance_on_unit_sphere,
-    find_closest_grid_point,
     spherical_angle,
 )
 
@@ -188,144 +188,123 @@ def unwrap(lon, center=0.0):
 
 
 # ---------------------------------------------------------------------------
-# Instrumented replay of `sectionate.section.infer_grid_path`
+# Instrumented replay of `sectionate.walk.infer_grid_path`
 # ---------------------------------------------------------------------------
-DIRECTIONS = ("right", "left", "down", "up")  # the order infer_grid_path probes
+def _compass(here, there):
+    """A display label for the step from one corner to another.
+
+    Purely cosmetic. The walk itself has no notion of direction -- it steps along
+    the corner graph, where a periodic wrap and a tile seam are edges like any
+    other -- but a reader following the animation wants to know which way the
+    picture moved.
+    """
+    dlon = ((there[0] - here[0] + 180.0) % 360.0) - 180.0
+    if abs(dlon) >= abs(there[1] - here[1]):
+        return "right" if dlon > 0 else "left"
+    return "up" if there[1] > here[1] else "down"
 
 
-def replay_walk(gridlon, gridlat, neighbor_maps, lons, lats):
+def replay_walk(topology, lons, lats):
     """Replay the walk, recording per-step decision state for drawing.
 
-    Mirrors the loop in ``sectionate.section.infer_grid_path`` (single-tile,
-    ``curve="great circle"``). Returns ``(segments, path)`` where ``path`` is the
-    stitched list of ``(j, i)`` corners, matching ``grid_section``.
+    Mirrors the loop in ``sectionate.walk.infer_grid_path`` (``curve="great
+    circle"``). Returns ``(segments, path)`` where ``path`` is the stitched list of
+    ``(j, i)`` corners, matching ``grid_section``.
     """
-    def neighbor(direction, j, i):
-        _, jmap, imap = neighbor_maps[direction]
-        return (int(jmap[j, i]), int(imap[j, i]))
-
-    segments, path = [], []
+    nlon, nlat, _known = topology._positions()
+    segments, nodes_all = [], []
 
     for seg in range(len(lons) - 1):
-        i1, j1 = find_closest_grid_point(lons[seg], lats[seg], gridlon, gridlat)
-        i2, j2 = find_closest_grid_point(lons[seg + 1], lats[seg + 1], gridlon, gridlat)
-        lon1, lat1 = gridlon[j1, i1], gridlat[j1, i1]
-        lon2, lat2 = gridlon[j2, i2], gridlat[j2, i2]
+        n1 = find_closest_corner(lons[seg], lats[seg], topology)
+        n2 = find_closest_corner(lons[seg + 1], lats[seg + 1], topology)
+        lon1, lat1 = nlon[n1], nlat[n1]
+        lon2, lat2 = nlon[n2], nlat[n2]
 
-        def progress(lon, lat):
-            return distance_on_unit_sphere(lon, lat, lon2, lat2)
+        def progress(n):
+            return distance_on_unit_sphere(nlon[n], nlat[n], lon2, lat2)
 
-        def deviation(lon, lat):
-            return (spherical_angle(lon2, lat2, lon1, lat1, lon, lat)
-                    + spherical_angle(lon1, lat1, lon2, lat2, lon, lat))
+        def deviation(n):
+            return (spherical_angle(lon2, lat2, lon1, lat1, nlon[n], nlat[n])
+                    + spherical_angle(lon1, lat1, lon2, lat2, nlon[n], nlat[n]))
 
-        j, i = j1, i1
-        j_prev, i_prev = j, i
-        corners = [(j, i)]
+        def order_key(n):
+            f, j, i = topology.node_native[n]
+            return (int(f), int(j), int(i), int(n))
+
+        here, prev = n1, -1
+        nodes = [here]
         steps = []
 
-        while (j, i) != (j2, i2):
-            here = (j, i)
-            prev = (j_prev, i_prev)
-            lon_h, lat_h = gridlon[j, i], gridlat[j, i]
-            d_current = distance_on_unit_sphere(lon_h, lat_h, lon2, lat2)
-            if d_current < COINCIDENT_TOLERANCE_M:
-                break
+        while here != n2:
+            d_current = progress(here)
+            p_current = d_current
+            cand, rows = [], []
 
-            nbrs = {d: neighbor(d, j, i) for d in DIRECTIONS}
-            skip = {here, prev}
-            p_current = progress(lon_h, lat_h)
-
-            cand = []       # (dev, (j, i), direction) for admitted neighbors
-            rows = []       # one record per direction, for the panel
-            chosen, why = None, ""
-
-            # The endpoint short-circuit: the first non-skipped neighbor that
-            # coincides with the endpoint is taken immediately.
-            for d in DIRECTIONS:
-                nb = nbrs[d]
-                if nb in skip:
-                    continue
-                if distance_on_unit_sphere(gridlon[nb], gridlat[nb], lon2, lat2) < COINCIDENT_TOLERANCE_M:
-                    chosen, why = d, "coincides with the endpoint"
-                    break
-            snap = chosen is not None
-
-            for d in DIRECTIONS:
-                nb = nbrs[d]
-                nb_lon, nb_lat = gridlon[nb], gridlat[nb]
-                rec = {"dir": d, "pt": nb, "dprog": None, "dev": None}
-                if nb == here:
-                    rec["cat"], rec["note"] = "wall", "wall"
-                elif nb == prev:
+            for m in sorted((int(x) for x in topology.neighbors(here)), key=order_key):
+                rec = {"dir": _compass((nlon[here], nlat[here]), (nlon[m], nlat[m])),
+                       "pt": _native_ji(topology, m), "dprog": None, "dev": None}
+                if m == prev:
                     rec["cat"], rec["note"] = "backtrack", "came from"
-                elif snap:
-                    # When the short-circuit fires, `infer_grid_path` never
-                    # reaches the scoring block -- neither `progress` nor
-                    # `deviation` is evaluated for any neighbor. Leave both
-                    # blank rather than display numbers the algorithm did not
-                    # compute (deviation *at* the endpoint is the degenerate
-                    # case the short-circuit exists to avoid).
-                    if d == chosen:
-                        rec["cat"], rec["note"] = "snap", "coincides with the endpoint"
-                    else:
-                        rec["cat"], rec["note"] = "unevaluated", "not evaluated"
                 else:
-                    p_nb = progress(nb_lon, nb_lat)
+                    p_nb = progress(m)
                     rec["dprog"] = p_nb - p_current
-                    seam_twin = distance_on_unit_sphere(
-                        nb_lon, nb_lat, lon_h, lat_h) < COINCIDENT_TOLERANCE_M
-                    if p_nb < p_current or seam_twin:
-                        dev = deviation(nb_lon, nb_lat)
+                    if p_nb < p_current:
+                        dev = deviation(m)
                         if np.isfinite(dev):
                             rec["cat"], rec["dev"], rec["note"] = "admitted", dev, ""
-                            cand.append((dev, nb, d))
+                            cand.append((dev, m))
                         else:
                             rec["cat"], rec["note"] = "rejected", "deviation undefined"
                     else:
                         rec["cat"], rec["note"] = "rejected", "farther"
                 rows.append(rec)
 
-            if chosen is None:
-                if cand:
-                    best = min(c[0] for c in cand)
-                    tied = [c for c in cand if c[0] <= best + WALK_DEVIATION_ATOL]
-                    winner = min(tied, key=lambda c: (c[1][0], c[1][1]))
-                    chosen = winner[2]
-                    why = ("smallest deviation" if len(tied) == 1
-                           else "deviation tied; broken by lowest (j, i)")
-                else:
-                    alt = [d for d in DIRECTIONS if nbrs[d] not in skip] or \
-                          [d for d in DIRECTIONS if nbrs[d] != prev]
-                    chosen = min(alt, key=lambda d: (
-                        distance_on_unit_sphere(gridlon[nbrs[d]], gridlat[nbrs[d]], lon2, lat2),
-                        nbrs[d][0], nbrs[d][1]))
-                    why = "no admissible move; nearest neighbor"
+            if cand:
+                best = min(c[0] for c in cand)
+                tied = [c for c in cand if c[0] <= best + WALK_DEVIATION_ATOL]
+                chosen = min(tied, key=lambda c: order_key(c[1]))[1]
+                why = ("smallest deviation" if len(tied) == 1
+                       else "deviation tied; broken by lowest (j, i)")
+            else:
+                alt = [int(m) for m in topology.neighbors(here) if m != prev]
+                chosen = min(alt, key=lambda m: (float(progress(m)), order_key(m)))
+                why = "no admissible move; nearest neighbor"
 
+            for rec in rows:
+                if rec["pt"] == _native_ji(topology, chosen):
+                    rec["cat"] = rec["cat"] if rec["cat"] == "admitted" else rec["cat"]
             steps.append({
-                "here": here, "prev": prev, "rows": rows,
-                "chosen": chosen, "why": why, "snap": snap,
-                "remaining": d_current,
-                "wrapped": abs(nbrs[chosen][1] - i) > 1,
+                "here": _native_ji(topology, here),
+                "prev": _native_ji(topology, prev) if prev >= 0 else None,
+                "rows": rows,
+                "chosen": _compass((nlon[here], nlat[here]),
+                                   (nlon[chosen], nlat[chosen])),
+                "why": why, "snap": False, "remaining": d_current,
+                "wrapped": abs(_native_ji(topology, chosen)[1]
+                               - _native_ji(topology, here)[1]) > 1,
             })
-
-            j_prev, i_prev = j, i
-            j, i = nbrs[chosen]
-            corners.append((j, i))
+            prev, here = here, chosen
+            nodes.append(here)
 
         segments.append({
-            "start": (j1, i1), "end": (j2, i2),
+            "start": _native_ji(topology, n1), "end": _native_ji(topology, n2),
             "wp_lon": lons[seg], "wp_lat": lats[seg],
             "wp_lon_end": lons[seg + 1], "wp_lat_end": lats[seg + 1],
-            "corners": corners, "steps": steps,
+            "corners": [_native_ji(topology, n) for n in nodes], "steps": steps,
             "d0": distance_on_unit_sphere(lon1, lat1, lon2, lat2),
         })
-        # `create_section_composite` drops each segment's last point so the
-        # shared waypoint corner is not duplicated.
-        path.extend(corners[:-1])
+        # `grid_section` drops each segment's last point so the shared waypoint
+        # corner is not duplicated.
+        nodes_all.extend(nodes[:-1] if seg < len(lons) - 2 else nodes)
 
-    path.append(segments[-1]["corners"][-1])
+    corners, _ = native_path(topology, nodes_all)
+    path = [(int(j), int(i)) for _f, j, i in corners]
     return segments, path
+
+
+def _native_ji(topology, node):
+    _f, j, i = topology.node_native[node]
+    return (int(j), int(i))
 
 
 def build_frames(segments):
@@ -343,7 +322,7 @@ def build_frames(segments):
                        "caption": f"Waypoint {k + 1}: the coordinates you asked for."})
         frames.append({**base_open, "n_wp": k + 1, "n_snap": k + 1, "hold": 26,
                        "caption": f"Waypoint {k + 1} snaps to its nearest grid corner "
-                                  f"(find_closest_grid_point)."})
+                                  f"(find_closest_corner)."})
     frames.append({**base_open, "n_wp": nwp, "n_snap": nwp, "show_gc": True,
                    "hold": 46,
                    "caption": "Each consecutive pair of snapped corners defines one "
@@ -371,7 +350,7 @@ def build_frames(segments):
                 # Not exercised by the default waypoints, which stay away from
                 # the seam; kept so that moving them across it stays explained.
                 cap = ("The step crosses the periodic seam, so i wraps. The "
-                       "neighbour comes from build_neighbor_maps, not from i+1.")
+                       "neighbour comes from the corner graph, not from i+1.")
                 extra = 32
             elif st["why"] == "coincides with the endpoint":
                 cap = ("A neighbour coincides with the endpoint, so it is taken "
@@ -409,29 +388,24 @@ LABEL_ALIGN = {"right": ("left", "center"), "left": ("right", "center"),
                "up": ("center", "bottom"), "down": ("center", "top")}
 
 
-def _mesh_segments(gridlon, gridlat, neighbor_maps):
+def _mesh_segments(gridlon, gridlat, topology):
     """Every C-grid face of the corner lattice, as drawable polylines.
 
-    Built from the neighbor maps rather than from ``i+1``/``j+1``, so the
-    periodic wrap edge is a real edge and a wall is a missing one -- the drawn
-    mesh is exactly the graph the walk is allowed to move on.
+    Taken from the corner graph rather than from ``i+1``/``j+1``, so the periodic
+    wrap edge is a real edge and a wall is a missing one -- the drawn mesh is
+    literally the graph the walk is allowed to move on.
     """
-    ny, nx = gridlon.shape
     segs = []
-    for d in ("right", "up"):
-        _, jmap, imap = neighbor_maps[d]
-        for j in range(ny):
-            for i in range(nx):
-                jn, iN = int(jmap[j, i]), int(imap[j, i])
-                if (jn, iN) == (j, i):
-                    continue  # wall: no face here
-                lo, la = arc(gridlon[j, i], gridlat[j, i], gridlon[jn, iN], gridlat[jn, iN], n=8)
-                x = unwrap(lo)
-                if np.abs(np.diff(x)).max() > 180.0:
-                    continue  # wraps the display cut, far outside the window
-                if x.max() < LON_VIEW[0] - 20 or x.min() > LON_VIEW[1] + 20:
-                    continue
-                segs.append(np.column_stack([x, la]))
+    for a, b in topology.edges:
+        (ja, ia), (jb, ib) = _native_ji(topology, int(a)), _native_ji(topology, int(b))
+        lo, la = arc(gridlon[ja, ia], gridlat[ja, ia],
+                     gridlon[jb, ib], gridlat[jb, ib], n=8)
+        x = unwrap(lo)
+        if np.abs(np.diff(x)).max() > 180.0:
+            continue  # wraps the display cut, far outside the window
+        if x.max() < LON_VIEW[0] - 20 or x.min() > LON_VIEW[1] + 20:
+            continue
+        segs.append(np.column_stack([x, la]))
     return segs
 
 
@@ -934,13 +908,12 @@ def main():
     geo = get_geo_corners(grid)
     gridlon = np.asarray(geo["X"].values, dtype=float)
     gridlat = np.asarray(geo["Y"].values, dtype=float)
-    neighbor_maps = build_neighbor_maps(grid, geo)
+    topology = corner_topology(grid)
 
-    segments, path = replay_walk(gridlon, gridlat, neighbor_maps,
-                                 WAYPOINT_LONS, WAYPOINT_LATS)
+    segments, path = replay_walk(topology, WAYPOINT_LONS, WAYPOINT_LATS)
 
     # Fidelity gate: the replay above must reproduce the real algorithm exactly.
-    i_c, j_c, _, _ = grid_section(grid, WAYPOINT_LONS, WAYPOINT_LATS)
+    i_c, j_c, _f, _lo, _la = grid_section(grid, WAYPOINT_LONS, WAYPOINT_LATS)
     expected = list(zip(j_c.astype(int).tolist(), i_c.astype(int).tolist()))
     if path != expected:
         raise AssertionError(
@@ -960,9 +933,9 @@ def main():
             & (cy > LAT_VIEW[0] - 20) & (cy < LAT_VIEW[1] + 20))
     ctx = {
         "gridlon": gridlon, "gridlat": gridlat, "segments": segments,
-        "mesh": _mesh_segments(gridlon, gridlat, neighbor_maps),
+        "mesh": _mesh_segments(gridlon, gridlat, topology),
         "corner_x": cx[keep], "corner_y": cy[keep],
-        "snapped": [tuple(reversed(find_closest_grid_point(lo, la, gridlon, gridlat)))
+        "snapped": [_native_ji(topology, find_closest_corner(lo, la, topology))
                     for lo, la in zip(WAYPOINT_LONS, WAYPOINT_LATS)],
     }
 

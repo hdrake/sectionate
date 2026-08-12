@@ -4,138 +4,17 @@ import xarray as xr
 import dask
 
 from .gridutils import (
-    corner_offset, coord_dict, get_geo_corners, get_facedim, build_neighbor_maps,
-    outer_topology, NEIGHBOR_DIRECTIONS,
+    corner_offset, coord_dict, get_geo_corners, get_facedim,
 )
-from .section import distance_on_unit_sphere, COINCIDENT_TOLERANCE_M
+from .section import distance_on_unit_sphere
 
 
-def _edge_direction(A, neighbor_maps):
-    """Return a function mapping a neighbor point to the direction (right/left/up/down)
-    that reaches it from A=(f,j,i), or None if it is not a neighbor of A."""
-    f, j, i = A
-    out = {}
-    for d in NEIGHBOR_DIRECTIONS:
-        fm, jm, im = neighbor_maps[d]
-        out[(int(fm[f, j, i]), int(jm[f, j, i]), int(im[f, j, i]))] = d
-    return out
 
 
-# velocity (var, index-offset) for the section edge leaving corner (i,j) in each
-# local direction, on an 'outer' C-grid. V (vmo) lives at (X-center, Y-corner);
-# U (umo) at (X-corner, Y-center).
-_EDGE_VEL = {
-    "right": ("V", 0, 0),   # vmo at (center i,   corner j)
-    "left":  ("V", -1, 0),  # vmo at (center i-1, corner j)
-    "up":    ("U", 0, 0),   # umo at (corner i,   center j)
-    "down":  ("U", 0, -1),  # umo at (corner i,   center j-1)
-}
 
 
-def _in_velocity_range(var, vi, vj, ranges):
-    """
-    Whether the velocity index (vi, vj) is one that a face's own arrays actually hold.
-
-    `_anchor_velocity` builds a section edge's velocity index by offsetting the corner the
-    edge leaves from. Read in the frame of the face that corner belongs to, an edge that
-    stays inside that face always lands on a stored velocity. An edge that crosses a seam,
-    however, is stored on at most ONE of the two faces it touches: read in the other face's
-    frame the same edge produces an index that falls outside that face's array -- past its
-    high end, or negative. `_uv_for_edge` uses this check to tell the two apart, taking the
-    source face's index when it is in range and otherwise the destination face's, so a
-    velocity is always read in the frame of the face that stores it and never has to be
-    rotated across the seam.
-
-    "At most one" because a staggered tiling can also leave a seam edge stored on NEITHER
-    face -- a crossing through a corner the faces share but neither one stores. Such an edge
-    is out of range in both frames, which is `_uv_for_edge`'s third branch: it is degenerate
-    and carries no flux.
-
-    `ranges` holds a face's array lengths along each axis: "Xc"/"Yc" for the tracer-center
-    axes and "Xq"/"Yq" for the corner axes. A "V" (Y-direction) velocity sits at
-    (X-center, Y-corner) and a "U" (X-direction) velocity at (X-corner, Y-center).
-    """
-    if var == "V":  # vmo at (X-center, Y-corner)
-        return (0 <= vi < ranges["Xc"]) and (0 <= vj < ranges["Yq"])
-    if var == "U":  # umo at (X-corner, Y-center)
-        return (0 <= vi < ranges["Xq"]) and (0 <= vj < ranges["Yc"])
-    raise ValueError(f"velocity component must be 'U' or 'V', got {var!r}")
 
 
-def _anchor_velocity(d, f, j, i, offset):
-    """Staggered velocity index for the section edge leaving corner (f,j,i) in direction d,
-    read in face f's own frame. `offset` is the corner->velocity index shift from
-    `gridutils.corner_offset` (0 for 'outer'/'left', 1 for 'right'). Returns (var, vi, vj)."""
-    var, di, dj = _EDGE_VEL[d]
-    vi, vj = i + di, j + dj
-    vi, vj = (vi + offset, vj) if var == "V" else (vi, vj + offset)
-    return var, vi, vj
-
-
-def _local_vec(lon0, lat0, lon1, lat1):
-    """Displacement (point0 -> point1) in a local flat (east, north) frame, in degrees,
-    with longitudes scaled by cos(lat) and wrapped across the dateline."""
-    dlon = ((lon1 - lon0 + 180.0) % 360.0) - 180.0
-    return dlon * np.cos(np.deg2rad(0.5 * (lat0 + lat1))), (lat1 - lat0)
-
-
-def _left_sign(var, fv, jc, ic, A, B, glon, glat):
-    """
-    +1 if the stored velocity's positive direction points to the LEFT of the section's
-    direction of travel (A -> B), else -1. Computed from geography, so it stays consistent
-    across faces however the grid is rotated underneath -- which is what makes seam-crossing
-    (including rotated) transports orient correctly without a single global flip.
-
-    `var` is "U"/"V"; (fv, jc, ic) is the section corner on the velocity's own face, used to
-    read the velocity's positive (face +x for U, +y for V) direction from the corner positions.
-    """
-    fA, jA, iA = A
-    fB, jB, iB = B
-    tx, ty = _local_vec(glon[fA, jA, iA], glat[fA, jA, iA], glon[fB, jB, iB], glat[fB, jB, iB])
-    ny, nx = glon.shape[-2], glon.shape[-1]
-    if var == "U":   # umo positive -> face +x
-        i1, i2 = (ic, ic + 1) if ic + 1 < nx else (ic - 1, ic)
-        vx, vy = _local_vec(glon[fv, jc, i1], glat[fv, jc, i1], glon[fv, jc, i2], glat[fv, jc, i2])
-    else:            # vmo positive -> face +y
-        j1, j2 = (jc, jc + 1) if jc + 1 < ny else (jc - 1, jc)
-        vx, vy = _local_vec(glon[fv, j1, ic], glat[fv, j1, ic], glon[fv, j2, ic], glat[fv, j2, ic])
-    return 1 if (tx * vy - ty * vx) > 0 else -1  # cross(travel, vdir) > 0  <=>  vdir is left
-
-
-def _uv_for_edge(A, B, neighbor_maps, offset, ranges, glon, glat):
-    """
-    Velocity face for the directed section edge from corner A=(fA,jA,iA) to B=(fB,jB,iB).
-    Returns (var, i, j, face, Lsign), where Lsign is +1 if the stored velocity's positive
-    direction points left of travel (a geographic sign -- see `_left_sign`); var is "0" for a
-    degenerate edge that carries no flux.
-
-    The velocity index is read in a single face's frame, so no velocity is rotated across the
-    seam: the SOURCE face when the edge's normal velocity lives there (the usual case, and where
-    a rotated connection needs no rotation since the edge is a normal X/Y edge on that face);
-    otherwise the DESTINATION face (e.g. the trailing edge of a crossing whose normal velocity
-    lives there); otherwise the edge is degenerate (a crossing through a shared boundary corner
-    of an 'outer' tiling). The sign is always geographic, so rotated seams orient correctly.
-    """
-    fA, jA, iA = A
-    fB, jB, iB = B
-    d = _edge_direction(A, neighbor_maps)[B]
-    seam = fA != fB
-
-    # 1. source-frame velocity (always valid within a face)
-    var_s, vi_s, vj_s = _anchor_velocity(d, fA, jA, iA, offset)
-    if not seam or _in_velocity_range(var_s, vi_s, vj_s, ranges):
-        Lsign = _left_sign(var_s, fA, jA, iA, A, B, glon, glat)
-        return var_s, int(vi_s), int(vj_s), int(fA), Lsign
-
-    # 2. destination-frame velocity (the edge sits on B's d2-side)
-    d2 = _edge_direction(B, neighbor_maps)[A]  # direction from B back to A
-    var_d, vi_d, vj_d = _anchor_velocity(d2, fB, jB, iB, offset)
-    if _in_velocity_range(var_d, vi_d, vj_d, ranges):
-        Lsign = _left_sign(var_d, fB, jB, iB, A, B, glon, glat)
-        return var_d, int(vi_d), int(vj_d), int(fB), Lsign
-
-    # 3. degenerate crossing through a shared boundary corner -- carries no flux.
-    return "0", 0, 0, int(fB), 0
 
 
 def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
@@ -171,98 +50,92 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
             direction of travel, else -1 (a geometric sign that stays consistent across
             rotated face seams; used in place of "Xinc"/"Yinc").
     """
-    i_c = np.asarray(i_c)
-    j_c = np.asarray(j_c)
-    offset = corner_offset(grid)
-    geocorners = get_geo_corners(grid)
-    glon = np.asarray(geocorners["X"].values)
-    glat = np.asarray(geocorners["Y"].values)
+    from .topology import corner_topology
 
-    if f_c is not None:
-        # Resolve each corner to its canonical native representation on the
-        # grid's corner topology, dropping consecutive corners that are the
-        # same physical point. Sections saved before multi-tile paths became
-        # twin-free step through both native copies of a shared seam corner:
-        # that zero-length edge is not a velocity face, and the neighbor maps
-        # used below link only canonical representations.
-        ot = outer_topology(grid)
-        f_c = np.asarray(f_c)
-        nodes = ot.node_id[f_c, j_c + ot.t, i_c + ot.t]
-        if (nodes < 0).any():
-            raise ValueError("Section contains indices that are not grid corners.")
-        keep = np.ones(nodes.size, dtype=bool)
-        keep[1:] = nodes[1:] != nodes[:-1]
-        nat = ot.node_native[nodes[keep]]
-        f_c, j_c, i_c = nat[:, 0].copy(), nat[:, 1].copy(), nat[:, 2].copy()
+    i_c = np.asarray(i_c, dtype=np.int64)
+    j_c = np.asarray(j_c, dtype=np.int64)
+    topology = corner_topology(grid)
+    t = topology.t
+    faces = (np.zeros_like(i_c) if f_c is None else np.asarray(f_c, dtype=np.int64))
 
-    nsec = i_c.size
+    # Which physical corner each given index denotes. Everything below is decided
+    # from these, so it does not matter which of a corner's spellings the caller
+    # used, nor whether a seam crossing was written with both of them or one.
+    if (
+        (faces < 0).any() or (faces >= topology.nf).any()
+        or (j_c + t < 0).any() or (j_c + t >= topology.nqy).any()
+        or (i_c + t < 0).any() or (i_c + t >= topology.nqx).any()
+    ):
+        raise ValueError("Section contains indices that are not grid corners.")
+    nodes = topology.node_id[faces, j_c + t, i_c + t]
+
+    handed = topology.face_handedness
+    var, vi, vj, vface, lsign, qq, xinc, yinc = [], [], [], [], [], [], [], []
+
+    for k in range(nodes.size - 1):
+        a, b = int(nodes[k]), int(nodes[k + 1])
+        if a == b:
+            # Two spellings of one corner. The step spans no cell, so it is not a
+            # velocity face -- this is how a seam crossing is written, and dropping
+            # it here is what stops the crossing being counted twice.
+            continue
+        stored = topology.edge_velocities(a, b)
+        if not stored:
+            raise ValueError(
+                f"The section steps from corner (face={faces[k]}, j={j_c[k]}, "
+                f"i={i_c[k]}) to (face={faces[k+1]}, j={j_c[k+1]}, i={i_c[k+1]}), "
+                "which is not one step across a velocity face. Either the two "
+                "corners are not neighbours on this grid, or the face between them "
+                "is stored on none of its arrays. A section must step from each "
+                "corner to an adjacent one."
+            )
+        # Read the face in the spelling the section was actually written in. Where a
+        # fold stores one edge twice, the two copies sit in mirrored frames and carry
+        # opposite signs, so a section that runs out and back along such a row only
+        # cancels if each traversal is read in its own frame. Falling back to the
+        # section's face, and then to any storage, covers a crossing written in the
+        # frame it is leaving.
+        want = (
+            (int(faces[k]), int(j_c[k]) + t, int(i_c[k]) + t),
+            (int(faces[k + 1]), int(j_c[k + 1]) + t, int(i_c[k + 1]) + t),
+        )
+        pick = next(
+            (s for s in stored if s[7] == want),
+            next((s for s in stored if s[1] == faces[k]), stored[0]),
+        )
+        v, f, jv, iv, _to_cell, _from_cell, step, _slots = pick
+
+        if v == "U":
+            # `+x` velocity: it points left of travel when travel runs in `-y`.
+            s = -1 if step[0] > 0 else 1
+        else:
+            # `+y` velocity: it points left of travel when travel runs in `+x`.
+            s = 1 if step[1] > 0 else -1
+
+        var.append(v)
+        vi.append(int(iv))
+        vj.append(int(jv))
+        vface.append(int(f))
+        lsign.append(int(s) * int(handed[f]))
+        xinc.append(bool(step[1] > 0))
+        yinc.append(bool(step[0] > 0))
+        qq.append(k)
+
     uvindices = {
-        "var":np.zeros(nsec-1, dtype="<U2"),
-        "i":np.zeros(nsec-1, dtype=np.int64),
-        "j":np.zeros(nsec-1, dtype=np.int64),
-        "Yinc":np.zeros(nsec-1, dtype=bool),
-        "Xinc":np.zeros(nsec-1, dtype=bool)
+        "var": np.array(var, dtype="<U2"),
+        "i": np.array(vi, dtype=np.int64),
+        "j": np.array(vj, dtype=np.int64),
+        "Yinc": np.array(yinc, dtype=bool),
+        "Xinc": np.array(xinc, dtype=bool),
+        "Lsign": np.array(lsign, dtype=np.int64),
+        "q": np.array(qq, dtype=np.int64),
     }
-
     if f_c is not None:
-        f_c = np.asarray(f_c)
-        # Multi-tile grid: attribute each section edge's velocity face by the
-        # inside-cell / dual-anchor rule, which handles face seams (see `_uv_for_edge`).
-        # The transport sign is carried geometrically in "Lsign" (+1 if the velocity's
-        # positive direction points left of travel) so that it stays consistent across
-        # rotated faces -- unlike the face-frame "Xinc"/"Yinc" used for single-tile grids.
-        coords = coord_dict(grid)
-        ranges = {
-            "Xc": grid._ds[coords["X"]["center"]].size,
-            "Yc": grid._ds[coords["Y"]["center"]].size,
-            "Xq": grid._ds[coords["X"]["corner"]].size,
-            "Yq": grid._ds[coords["Y"]["corner"]].size,
-        }
-        uvindices["face"] = np.zeros(nsec-1, dtype=np.int64)
-        uvindices["Lsign"] = np.zeros(nsec-1, dtype=np.int64)
-        neighbor_maps = build_neighbor_maps(grid, geocorners)
-        for k in range(0, nsec-1):
-            A = (int(f_c[k]), int(j_c[k]), int(i_c[k]))
-            B = (int(f_c[k+1]), int(j_c[k+1]), int(i_c[k+1]))
-            var, vi, vj, face, Lsign = _uv_for_edge(A, B, neighbor_maps, offset, ranges, glon, glat)
-            uvindices["var"][k] = var
-            uvindices["i"][k] = vi
-            uvindices["j"][k] = vj
-            uvindices["face"][k] = face
-            uvindices["Lsign"][k] = Lsign
-    else:
-        for k in range(0, nsec-1):
-            zonal = not(j_c[k+1] != j_c[k])
-            Xinc = i_c[k+1] > i_c[k]
-            Yinc = j_c[k+1] > j_c[k]
-            # Handle corner cases for wrapping boundaries
-            if (i_c[k+1] - i_c[k])>1: Xinc = False
-            elif (i_c[k+1] - i_c[k])<-1: Xinc = True
-            uvindex = {
-                "var": "V" if zonal else "U",
-                "i": i_c[k+(1 if not(Xinc) and zonal else 0)],
-                "j": j_c[k+(1 if not(Yinc) and not(zonal) else 0)],
-                "Yinc": Yinc,
-                "Xinc": Xinc,
-            }
-            uvindex["i"] += (offset if zonal else 0)
-            uvindex["j"] += (offset if not(zonal) else 0)
-            for (key, v) in uvindices.items():
-                v[k] = uvindex[key]
+        uvindices["face"] = np.array(vface, dtype=np.int64)
+    return uvindices
 
-    # Drop zero-length faces. A single physical corner can carry two indices -- at a
-    # periodic seam, a shared multi-tile boundary corner, or the bipolar fold seam -- so
-    # the section path can contain a consecutive pair whose endpoints are the same point.
-    # That edge spans no grid cell and carries no flux, so it is not a velocity face. Both
-    # corners are kept (they anchor the real faces on either side), but the degenerate edge
-    # between them emits no face. Done here, in the deterministic corner->face derivation,
-    # so it applies identically when a saved section is reloaded from its (i_c, j_c[, f_c]).
-    if f_c is not None:
-        clon, clat = glon[f_c, j_c, i_c], glat[f_c, j_c, i_c]
-    else:
-        clon, clat = glon[j_c, i_c], glat[j_c, i_c]
-    keep = distance_on_unit_sphere(clon[:-1], clat[:-1], clon[1:], clat[1:]) > COINCIDENT_TOLERANCE_M
-    return {key: np.asarray(val)[keep] for key, val in uvindices.items()}
+
+
 
 def uvcoords_from_uvindices(grid, uvindices):
     """
@@ -534,26 +407,17 @@ def convergent_transport(
     if facedim is not None:
         sect["face"] = xr.DataArray(uvindices["face"], dims=sect_coord)
     fsel = {facedim: sect["face"]} if facedim is not None else {}
-    sect["Usign"] = xr.DataArray(
-        np.array([1 if i else -1 for i in ~uvindices["Yinc"]]),
-        dims=sect_coord
-    )
-    sect["Vsign"] = xr.DataArray(
-        np.array([1 if i else -1 for i in uvindices["Xinc"]]),
-        dims=sect_coord
-    )
     sect["var"] = xr.DataArray(uvindices["var"], dims=sect_coord)
     sect["Umask"] = xr.DataArray(uvindices["var"]=="U", dims=sect_coord)
     sect["Vmask"] = xr.DataArray(uvindices["var"]=="V", dims=sect_coord)
 
-    # Per-edge sign: +1 if the velocity's positive direction points left of the section's
-    # direction of travel. Multi-tile grids carry this geometrically (`Lsign`), so it stays
-    # consistent across rotated faces; single-tile grids reduce to the original face-frame
-    # Usign/Vsign, leaving those results unchanged.
-    if facedim is not None:
-        sect["Lsign"] = xr.DataArray(uvindices["Lsign"], dims=sect_coord)
-    else:
-        sect["Lsign"] = sect["Usign"]*sect["Umask"] + sect["Vsign"]*sect["Vmask"]
+    # Per-edge sign: +1 if the velocity's positive direction points left of the
+    # section's direction of travel. Both are read in the frame the velocity is
+    # stored in, so a rotated or reversed seam needs no special case, and an edge
+    # whose two corners happen to coincide still gets a definite answer. This is the
+    # only sign there is now: the face-frame `Usign`/`Vsign` said the same thing on a
+    # single-tile grid and the wrong thing on any other, so they are gone.
+    sect["Lsign"] = xr.DataArray(uvindices["Lsign"], dims=sect_coord)
 
     mask_types = (np.ndarray, dask.array.Array, xr.DataArray)
     if isinstance(positive_in, mask_types):
@@ -595,6 +459,18 @@ def convergent_transport(
             )
         else:
             # Closed section encloses a polygon: orient so `positive_in` means "into" it.
+            if np.any(np.abs(np.asarray(lats_q, dtype=float)) > 90. - 1.e-6):
+                warnings.warn(
+                    "This closed section has a corner on a geographic pole, and the "
+                    "inward sense of `positive_in` cannot be determined reliably "
+                    "there. Orientation comes from the signed area of a stereographic "
+                    "projection, which sends one pole to infinity, so a corner sitting "
+                    "on it dominates the area and can invert the result -- it does so "
+                    "for the cells around the Arctic cap's pole on a lat-lon-cap grid. "
+                    "Check the sign, or pass `positive_in` as a cell mask, which is "
+                    "decided from the cells either side of a face and does not use the "
+                    "projection at all."
+                )
             counterclockwise = is_section_counterclockwise(
                 lons_q, lats_q, geometry=geometry
             )
@@ -715,11 +591,12 @@ def is_section_counterclockwise(lons_c, lats_c, geometry="spherical"):
         X, Y = lons_c, lats_c
     else:
         raise ValueError("""Only "spherical" and "cartesian" geometries are currently supported.""")
-    
+
     signed_area = 0.
     for i in range(X.size-1):
         signed_area += (X[i+1]-X[i])*(Y[i+1]+Y[i])
     return signed_area < 0.
+
 
 def stereographic_projection(lons, lats):
     """

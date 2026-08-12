@@ -14,7 +14,8 @@ import xarray as xr
 import xgcm
 import pytest
 
-from sectionate.gridutils import outer_topology, corner_position
+from sectionate.gridutils import corner_position
+from sectionate.topology import corner_topology
 from sectionate.section import grid_section
 from sectionate.transports import convergent_transport
 
@@ -203,27 +204,26 @@ def cube_left_grid():
 def test_cube_topology_is_complete_and_consistent():
     """Every cube corner resolves to a coherent node. A 'left'-staggered cube
     stores 6*Nc**2 corners for 6*Nc**2 + 2 physical points, so exactly two cube
-    vertices live on no face: those become edge-less nodes (no native path
-    corner can exist there, so their junction edges are genuine closed
-    boundaries (walls)), their
-    six seam-neighbours lose that one edge, and the six stored vertices are
-    ordinary 3-valent junction nodes -- crossable, unlike under the old
-    junction-walling repair."""
+    vertices live on no face.
+
+    They are still corners: three faces meet there, so they have three neighbours
+    like the other six vertices, and a section may pass through them. What they do
+    not have is a native index, and asking for one says so rather than inventing it.
+    """
     grid, _ = cube_left_grid()
     assert corner_position(grid) == "left"
-    ot = outer_topology(grid)
-    assert (ot.node_id >= 0).all()
+    ot = corner_topology(grid)
     deg = np.array([len(a) for a in ot.node_adj])
     native = ot.node_native[:, 0] >= 0
     assert len(deg) == 6 * Nc * Nc + 2
     assert np.count_nonzero(~native) == 2             # the two unstored vertices
-    assert np.array_equal(np.where(~native)[0], np.where(deg == 0)[0])
-    nreps = np.array([len(r) for r in ot.node_reps])
-    stored_vertices = (deg == 3) & (nreps == 3) & native
-    assert np.count_nonzero(stored_vertices) == 6     # 8 cube vertices - 2 unstored
-    # neighbours of the unstored vertices lose exactly the edge into them
-    assert np.count_nonzero((deg == 3) & ~stored_vertices & native) == 6
-    assert np.count_nonzero(deg == 4) == len(deg) - 14
+    assert deg.min() == 3                             # nothing is walled off
+    # all 8 cube vertices are 3-valent, stored or not; everything else is 4-valent
+    assert np.count_nonzero(deg == 3) == 8
+    assert np.count_nonzero(deg == 4) == len(deg) - 8
+    assert np.all(deg[~native] == 3)
+    with pytest.raises(ValueError, match="stores it on no face"):
+        ot.native_of(np.where(~native)[0][:1])
 
 
 def _coordinate_jittered_cube_left_grid(eps=2.0):
@@ -280,8 +280,7 @@ def test_disagreeing_extrapolation_junction_merges_and_conserves():
     sum to zero cell-by-cell for the streamfunction flow.
     """
     grid, _ = _coordinate_jittered_cube_left_grid()
-    ot = outer_topology(grid)
-    assert (ot.node_id >= 0).all()
+    ot = corner_topology(grid)
 
     # (a) the disagreeing corner slots collapse to one node per junction: exactly
     #     two non-native nodes (as on the exact cube), each merging three slots
@@ -314,7 +313,7 @@ def test_cube_corner_resolution_is_coordinate_jitter_independent():
     spacing near the vertices) exceeds the snap-acceptance band, so a purely
     coordinate-based resolution would mis-place the cross-face vertex slots."""
     grid0, _ = cube_left_grid()
-    ot0 = outer_topology(grid0)
+    ot0 = corner_topology(grid0)
 
     def native_nodes(ot):
         return set(tuple(int(x) for x in r) for r in ot.node_native if r[0] >= 0)
@@ -330,7 +329,7 @@ def test_cube_corner_resolution_is_coordinate_jitter_independent():
         return E
 
     grid, _ = _coordinate_jittered_cube_left_grid(eps=2.0)
-    ot = outer_topology(grid)
+    ot = corner_topology(grid)
 
     # native corner topology (the part that carries transports) is unchanged
     assert native_nodes(ot) == native_nodes(ot0)
@@ -347,7 +346,7 @@ def test_cube_padded_transports_sum_to_zero_exactly():
     streamfunction flow, cell by cell -- including along every rotated seam and
     around the cube vertices."""
     grid, _ = cube_left_grid()
-    ot = outer_topology(grid)
+    ot = corner_topology(grid)
     Uo, Vo = ot.padded_transports(grid._ds.u, grid._ds.v)
     conv = (Uo[:, :, :-1] - Uo[:, :, 1:]) + (Vo[:, :-1, :] - Vo[:, 1:, :])
     assert np.abs(conv).max() < 1e-12
@@ -365,7 +364,7 @@ def test_cube_section_transport_is_streamfunction_difference(lonlat):
     i_c, j_c, f_c, lons_c, lats_c = grid_section(grid, list(lons), list(lats))
     conv = convergent_transport(grid, i_c, j_c, f_c, utr="u", vtr="v")["conv_mass_transport"].sum().values
     # endpoint psi values, from the walked path's own native endpoints
-    ot = outer_topology(grid)
+    ot = corner_topology(grid)
     cxyz = _outer_corners_xyz()
     psi_o = _psi(cxyz)
     p = []
@@ -384,14 +383,14 @@ def test_cube_section_over_pole_has_stable_geometric_sign(lonlat, faces_expected
     """A section whose great circle passes over the geographic north pole -- the one
     soft spot of the geometric per-edge sign that Geoff flagged in review.
 
-    ``_left_sign`` (transports.py) orients each edge by a cross product in a local
+    The per-edge sign orients each edge in the frame the velocity is stored in, in a
     flat (east, north) frame, which degenerates exactly at the pole: ``cos(lat) -> 0``
     shrinks the east component and longitude is ill-defined at the +Z face-center
     corner, which this cube stores right on ``lat = 90``. The pole-adjacent edges
     carry real flux, so a sign that flipped there would break the exact
     equality by a finite amount. The single-tile bipolar fold signs via
     ``Usign``/``Vsign`` instead, so this multi-tile cube (whose polar cap actually
-    invokes ``_left_sign``) is where the concern must be pinned down.
+    invokes that sign) is where the concern must be pinned down.
     """
     grid, psi = cube_left_grid()
     (lon0, lon1), (lat0, lat1) = lonlat
@@ -423,7 +422,7 @@ def test_cube_closed_section_around_vertex_carries_zero_net_transport():
     rotated seams; the vertex itself is stored on at most one face) must carry
     exactly zero net transport for the non-divergent streamfunction flow."""
     grid, _ = cube_left_grid()
-    ot = outer_topology(grid)
+    ot = corner_topology(grid)
     deg = np.array([len(a) for a in ot.node_adj])
     nreps = np.array([len(r) for r in ot.node_reps])
     n = int(np.where((deg == 3) & (nreps == 3))[0][0])   # a stored cube vertex
@@ -518,7 +517,7 @@ def test_cube_right_staggered_padded_transports_sum_to_zero():
     exactly zero cell-by-cell for the streamfunction flow."""
     grid, _ = _cube_variant(_find_all_low_high_rotations(), stagger="right")
     assert corner_position(grid) == "right"
-    ot = outer_topology(grid)
+    ot = corner_topology(grid)
     Uo, Vo = ot.padded_transports(grid._ds.u, grid._ds.v)
     conv = (Uo[:, :, :-1] - Uo[:, :, 1:]) + (Vo[:, :-1, :] - Vo[:, 1:, :])
     assert np.abs(conv).max() < 1e-12
@@ -550,7 +549,7 @@ def test_open_wall_padded_transports_zeroes_walls_and_reads_seam_twin():
         1: {"X": (None, None), "Y": ((0, "Y", False), None)},
     }}
     grid, _ = _cube_variant(rots, stagger="left", faces=[f0, nbr], fc=fc)
-    ot = outer_topology(grid)
+    ot = corner_topology(grid)
     Uo, Vo = ot.padded_transports(grid._ds.u, grid._ds.v)
     v = np.asarray(grid._ds.v.values)
 
@@ -562,10 +561,14 @@ def test_open_wall_padded_transports_zeroes_walls_and_reads_seam_twin():
     assert np.any(Vo[0, Nc, :] != 0.0)             # genuinely nonzero
 
 
-def test_same_side_reverse_gluing_raises():
-    """A same-side (`reverse=True`) gluing leaves a whole seam line of corners
-    stored on no face (degenerate on a staggered grid); `outer_topology` must
-    raise an error rather than return an invalid topology."""
+def test_same_side_reverse_gluing_leaves_corners_unstored_but_resolved():
+    """A same-side (`reverse=True`) gluing on a staggered grid meets along the edge
+    the staggering drops, so a whole seam line of corners is stored on no face.
+
+    That is a fact about the data, not a reason to refuse the grid: the corners are
+    resolved like any others and can be walked through, and it is only asking for
+    their native index that has no answer. The corner count still closes on the
+    polyhedron, which is what says the topology is right."""
     import itertools
 
     def has_same_side_gluing(rots):
@@ -579,8 +582,12 @@ def test_same_side_reverse_gluing_raises():
     same_side = next(r for r in itertools.product(range(4), repeat=6)
                      if has_same_side_gluing(r))
     grid, _ = _cube_variant(same_side, stagger="left")
-    with pytest.raises((NotImplementedError, ValueError)):
-        outer_topology(grid)
+    ot = corner_topology(grid)
+    assert ot.n_nodes == 6 * Nc * Nc + 2
+    unstored = np.where(ot.node_native[:, 0] < 0)[0]
+    assert unstored.size > 0                          # the dropped seam line
+    with pytest.raises(ValueError, match="stores it on no face"):
+        ot.native_of(unstored[:1])
 
 
 def test_outer_reverse_gluing_matches_by_coincidence():
@@ -599,8 +606,7 @@ def test_outer_reverse_gluing_matches_by_coincidence():
     assert any(c is not None and c[2]                                # really has reverse=True
                for face in fc.values() for s in face.values() for c in s)
 
-    ot = outer_topology(grid)                                        # builds; reverse is fine on outer
-    assert (ot.node_id >= 0).all()
+    ot = corner_topology(grid)                                        # builds; reverse is fine on outer
     assert np.all(ot.node_native[:, 0] >= 0)                        # every corner stored (0 unstored)
 
     # a section crossing several faces (hence reverse seams): transport == dpsi
@@ -610,3 +616,163 @@ def test_outer_reverse_gluing_matches_by_coincidence():
     p0 = psi[int(f_c[0]), int(j_c[0]), int(i_c[0])]
     p1 = psi[int(f_c[-1]), int(j_c[-1]), int(i_c[-1])]
     assert np.isclose(abs(float(conv)), abs(p1 - p0), rtol=1e-9)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Known, pre-existing: a closed section with a corner exactly at a geographic "
+    "pole gets `positive_in` inverted. Orientation comes from the signed area of a "
+    "stereographic projection, and that projection sends one pole to infinity, so a "
+    "corner sitting on it projects to a radius that swamps the area. Not introduced "
+    "here -- it is unreachable on the base branch only because sections could not be "
+    "traced through such corners at all. Fixing it needs a decision this change does "
+    "not make: measuring the area on the sphere instead is exact at the poles but "
+    "degenerate for a section that follows a great circle (an equatorial latitude "
+    "circle encloses exactly half the sphere either way round), and choosing the "
+    "projection point per section silently redefines which cap `positive_in` means."
+))
+def test_closed_loop_with_a_polar_corner_gets_the_inward_sense_right():
+    """
+    A corner exactly at a geographic pole is ordinary, not exotic: it is a vertex of
+    every cell of an Arctic cap, and where a tripolar cap's singular meridian ends.
+
+    The oracle is the discrete divergence theorem, which knows nothing of
+    projections: the flux into a cell, integrated round its boundary, must equal that
+    cell's convergence computed straight from the staggered arrays.
+    """
+    import warnings as _warnings
+    from sectionate.gridutils import get_geo_corners
+
+    grid, _psi = _cube_variant(_find_all_low_high_rotations(), stagger="outer")
+    ds = grid._ds
+    cd = {a: grid.axes[a].coords for a in ("X", "Y")}
+    Xc, Yc = cd["X"]["center"], cd["Y"]["center"]
+    Xq, Yq = cd["X"]["outer"], cd["Y"]["outer"]
+    nf, nyc, nxc = ds.sizes["face"], ds.sizes[Yc], ds.sizes[Xc]
+
+    rng = np.random.default_rng(0)
+    u = rng.normal(size=(nf, nyc, ds.sizes[Xq]))
+    v = rng.normal(size=(nf, ds.sizes[Yq], nxc))
+    ds = ds.assign({"ut": ((("face", Yc, Xq)), u), "vt": ((("face", Yq, Xc)), v)})
+    g = xgcm.Grid(ds, coords={a: dict(grid.axes[a].coords) for a in ("X", "Y")},
+                  padding="fill", fill_value=np.nan,
+                  face_connections=grid._face_connections, autoparse_metadata=False)
+
+    lat_c = get_geo_corners(g)["Y"].transpose("face", Yq, Xq).values
+    polar = {(int(f), int(J), int(I))
+             for f, J, I in np.argwhere(np.isclose(np.abs(lat_c), 90.0))}
+    assert polar, "this cube should have corners exactly at a pole"
+
+    wrong = []
+    for f in range(nf):
+        for jc in range(nyc):
+            for ic in range(nxc):
+                touches = {(f, jc, ic), (f, jc, ic + 1), (f, jc + 1, ic), (f, jc + 1, ic + 1)}
+                if not (touches & polar):
+                    continue
+                want = u[f, jc, ic] - u[f, jc, ic + 1] + v[f, jc, ic] - v[f, jc + 1, ic]
+                # the default `positive_in=True`, so the inward sense comes from the
+                # section's own orientation -- the path the projection decides
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore")
+                    out = convergent_transport(
+                        g, [ic, ic + 1, ic + 1, ic, ic], [jc, jc, jc + 1, jc + 1, jc],
+                        f_c=[f] * 5, utr="ut", vtr="vt")
+                got = float(out["conv_mass_transport"].sum().values)
+                if abs(got - want) > 1e-12:
+                    wrong.append((f, jc, ic, got, want))
+    assert not wrong, f"{len(wrong)} polar cells have an inverted inward sense: {wrong[:3]}"
+
+
+def test_sections_route_around_corners_the_grid_cannot_name():
+    """
+    A cubed sphere stores `6N^2` corners for `6N^2 + 2` points, so two of its
+    vertices are stored on no face. They are real corners and the walk may cross
+    one, but a section through one cannot be written in native indices -- so where a
+    route exists through corners that *are* stored, the walk takes it.
+
+    Without that preference these sections died at the projection step, on a grid
+    every other test traces happily.
+    """
+    grid, _psi = cube_left_grid()
+    ct = corner_topology(grid)
+    unstored = np.flatnonzero(~ct.node_is_stored)
+    assert unstored.size == 2, "this fixture should have exactly two un-stored vertices"
+
+    # Waypoints whose route runs into one of the two un-stored vertices. Found by
+    # fuzzing with the preference disabled -- 8 of 400 random sections do -- so these
+    # fail without it, which is what makes this a guard rather than a description.
+    cases = [
+        ([78.1277, -64.7560], [32.9147, 6.5611]),
+        ([-72.1161, -11.3317], [21.6667, 31.1733]),
+        ([-40.6161, 137.1443], [-28.2220, -6.2761]),
+        ([-46.9771, -133.1498], [-7.3467, 82.8061]),
+    ]
+    for lons, lats in cases:
+        i_c, j_c, f_c, lons_c, lats_c = grid_section(grid, lons, lats)
+        nodes = ct.node_id[f_c, j_c + ct.t, i_c + ct.t]
+        assert (nodes >= 0).all()
+        assert not set(nodes.tolist()) & set(unstored.tolist()), (
+            "the section was routed through a corner it cannot be written with"
+        )
+
+
+def test_a_seam_stored_on_neither_face_says_which_staggering_caused_it():
+    """
+    Where a whole seam line is stored nowhere -- a same-side gluing meeting along the
+    edge a 'left' staggering drops -- there is no route around it, and a section
+    crossing it genuinely cannot be written in native indices. It should say so, and
+    say what to do, rather than fail obscurely.
+
+    Sections that do not need to cross it are unaffected, which is the point: the
+    grid is usable, not refused.
+    """
+    import itertools
+
+    def has_same_side_gluing(rots):
+        frames = _rotated_frames(rots)
+        for f, f2 in itertools.combinations(range(6), 2):
+            s = _shared_edge_sides(frames, f, f2)
+            if s is not None and s[0] == s[1]:
+                return True
+        return False
+
+    same_side = next(r for r in itertools.product(range(4), repeat=6)
+                     if has_same_side_gluing(r))
+    grid, _psi = _cube_variant(same_side, stagger="left")
+    ct = corner_topology(grid)
+    unstored = np.flatnonzero(~ct.node_is_stored)
+    assert unstored.size > 0
+
+    traced = failed = 0
+    rng = np.random.default_rng(0)
+    for _ in range(40):
+        p, q = rng.uniform(-180, 180, 2), rng.uniform(-70, 70, 2)
+        try:
+            grid_section(grid, p.tolist(), q.tolist())
+            traced += 1
+        except ValueError as err:
+            assert "stores it on no face" in str(err)
+            assert "'outer' staggering" in str(err)   # names the way out
+            failed += 1
+    assert traced > failed, "most sections on this grid should still trace"
+
+
+def test_a_face_that_is_not_consistently_oriented_is_reported():
+    """
+    A face is a chart of a piece of the sphere, so every cell of it runs the same way
+    round. Cells that do not are inside out, and the velocity faces around them would
+    be signed backwards -- silently, since the sign is read in the face's own frame.
+    """
+    grid, _psi = cube_left_grid()
+    ds = grid._ds.copy(deep=True)
+    cd = {a: grid.axes[a].coords for a in ("X", "Y")}
+    Xq, Yq = cd["X"]["left"], cd["Y"]["left"]
+    # mirror one cell's corners, leaving the rest of the face as it was
+    lon = ds["geolon_c"].values.copy()
+    lon[0, 2, 2], lon[0, 2, 3] = lon[0, 2, 3], lon[0, 2, 2]
+    ds["geolon_c"] = (("face", Yq, Xq), lon)
+    bad = xgcm.Grid(ds, coords={a: dict(grid.axes[a].coords) for a in ("X", "Y")},
+                    padding="fill", fill_value=np.nan,
+                    face_connections=grid._face_connections, autoparse_metadata=False)
+    with pytest.raises(ValueError, match="not consistently oriented"):
+        corner_topology(bad).face_handedness

@@ -1,11 +1,7 @@
 import numpy as np
 import xarray as xr
 
-from .gridutils import (
-    get_geo_corners,
-    get_facedim,
-    build_neighbor_maps,
-)
+from .gridutils import get_geo_corners, get_facedim
 
 # Two corner indices map to the same physical point on seams that fold Tor wrap (e.g.
 # the bipolar north fold). Geodesic distances below this many metres are treated as
@@ -157,12 +153,32 @@ class GriddedSection(Section):
             parent = section.parent
         )
         self.grid = grid
-        self.f_c = f_c
         if isinstance(i_c, (list, np.ndarray)) & isinstance(j_c, (list, np.ndarray)):
-            self.i_c = i_c
-            self.j_c = j_c
+            self.i_c = np.asarray(i_c, dtype=np.int64)
+            self.j_c = np.asarray(j_c, dtype=np.int64)
+            self.f_c = (np.zeros_like(self.i_c) if f_c is None
+                        else np.asarray(f_c, dtype=np.int64))
+            self._resolve_nodes()
         else:
             self.grid_section()
+
+    def _resolve_nodes(self):
+        """Which physical corner each index triple denotes, on this grid.
+
+        Always derived, never stored: a node id is an artefact of how the topology
+        was built, so a saved one could disagree with the grid it is loaded against.
+        Deriving it is also what lets a section built by hand, or reloaded from
+        indices, behave exactly like one this package traced.
+        """
+        from .topology import corner_topology
+        ct = corner_topology(self.grid)
+        if (
+            (self.f_c < 0).any() or (self.f_c >= ct.nf).any()
+            or (self.j_c + ct.t < 0).any() or (self.j_c + ct.t >= ct.nqy).any()
+            or (self.i_c + ct.t < 0).any() or (self.i_c + ct.t >= ct.nqx).any()
+        ):
+            raise ValueError("Section contains indices that are not grid corners.")
+        self.n_c = ct.node_id[self.f_c, self.j_c + ct.t, self.i_c + ct.t]
 
     def grid_section(self, **kwargs):
         """Pass this Section's coordinates to sectionate.grid_section
@@ -181,12 +197,8 @@ class GriddedSection(Section):
             self.lats_c,
             **kwargs
         )
-        if len(out) == 5:
-            self.i_c, self.j_c, self.f_c, self.lons_c, self.lats_c = out
-        else:
-            self.i_c, self.j_c, self.lons_c, self.lats_c = out
-            self.f_c = None
-
+        self.i_c, self.j_c, self.f_c, self.lons_c, self.lats_c = out
+        self._resolve_nodes()
         return out
     
     def copy(self):
@@ -197,7 +209,7 @@ class GriddedSection(Section):
             self.grid,                  # shared, not copied
             i_c=self.i_c.copy(),
             j_c=self.j_c.copy(),
-            f_c=None if self.f_c is None else self.f_c.copy(),
+            f_c=self.f_c.copy(),
         )
         # Carry over the gridded path coordinates (grid_section overwrites lons_c/lats_c
         # in place; `__init__` would otherwise reset them to the raw waypoint coords).
@@ -303,34 +315,56 @@ def grid_section(grid, lons, lats, curve="great circle"):
 
     Returns
     -------
-    i_c, j_c[, f_c], lons_c, lats_c: `np.ndarray`
-        (i_c, j_c) correspond to indices of vorticity points that define velocity faces. For
-        multi-tile grids, the face index f_c of each point is returned as well.
-        (lons_c, lats_c) are the corresponding longitude and latitudes.
+    i_c, j_c, f_c, lons_c, lats_c: `np.ndarray`
+        (i_c, j_c, f_c) are the indices of the vorticity points that define the
+        section's velocity faces, and (lons_c, lats_c) their coordinates. `f_c` is
+        the face each point belongs to; a single-tile grid is one face, so it is all
+        zeros there rather than absent -- the shape of the answer does not depend on
+        the shape of the grid.
     """
-    geocorners = get_geo_corners(grid)
-    facedim = get_facedim(grid)
+    from .topology import corner_topology
+    from .walk import find_closest_corner, infer_grid_path, native_path
 
+    facedim = get_facedim(grid)
     if facedim is not None:
         _check_supported_topology(grid)
 
-    # All topologies -- periodic wrap, fill/extend walls, multi-tile face
-    # connections, and the bipolar north fold -- are derived uniformly from the
-    # grid's xgcm metadata by padding index arrays (see `build_neighbor_maps`).
-    # Where a single physical corner carries two indices (a periodic seam, a shared
-    # multi-tile boundary corner, or the fold seam), the walk simply steps through
-    # both; the resulting zero-length section edge carries no flux and is dropped when
-    # faces are derived (see `transports.uvindices_from_qindices`).
-    neighbor_maps = build_neighbor_maps(grid, geocorners)
+    # Every topology a structured grid can declare -- a periodic wrap, a wall, a
+    # bipolar fold, a multi-tile seam however it is rotated -- becomes an ordinary
+    # edge of the grid's physical corner graph, so the walk below needs no case for
+    # any of them, and never has to ask whether two indices are the same corner.
+    topology = corner_topology(grid)
 
-    return create_section_composite(
-        geocorners["X"],
-        geocorners["Y"],
-        lons,
-        lats,
-        neighbor_maps=neighbor_maps,
-        curve=curve,
-    )
+    if len(lons) != len(lats):
+        raise ValueError("lons and lats should have the same length")
+
+    nodes = []
+    for k in range(len(lons) - 1):
+        segment_curve = _check_segment_span(
+            lons[k], lats[k], lons[k + 1], lats[k + 1], curve
+        )
+        n1 = find_closest_corner(lons[k], lats[k], topology)
+        n2 = find_closest_corner(lons[k + 1], lats[k + 1], topology)
+        seg = infer_grid_path(n1, n2, topology, curve=segment_curve)
+        nodes.extend(seg[:-1] if k < len(lons) - 2 else seg)
+
+    corners, _ = native_path(topology, nodes)
+    f_c, j_c, i_c = corners[:, 0], corners[:, 1], corners[:, 2]
+
+    # Report each corner's coordinate as its *emitted* representation stores it, not
+    # as the node's canonical one. The two are the same physical point, but a
+    # periodic seam's two spellings differ by a turn of longitude, and it is the
+    # emitted one that keeps the reported path continuous -- 300, 360 rather than
+    # 300, 0 -- which is what anything measuring a step along it depends on.
+    geo = get_geo_corners(grid)
+    glon = geo["X"].values
+    glat = geo["Y"].values
+    if facedim is None:
+        lons_c, lats_c = glon[j_c, i_c], glat[j_c, i_c]
+    else:
+        lons_c, lats_c = glon[f_c, j_c, i_c], glat[f_c, j_c, i_c]
+
+    return i_c, j_c, f_c, lons_c, lats_c
 
 
 def _check_supported_topology(grid):
@@ -338,7 +372,7 @@ def _check_supported_topology(grid):
     Raise if the multi-tile `grid` describes a topology sectionate cannot trace a section on.
 
     A section is traced by walking a graph of corner points, and a step across a tile seam is
-    recognised by its two ends having different face indices (see `transports._uv_for_edge`).
+    recognised by its two ends belonging to different faces.
     
     A face glued to *itself* therefore cannot be traced: both sides of such a seam carry the
     same face index, so a crossing is indistinguishable from an ordinary step within the face,
@@ -351,7 +385,7 @@ def _check_supported_topology(grid):
     A grid can still prove unsupported once its corner graph is actually built -- a corner that
     ends up with more than four neighbours, or a staggered grid whose seam corners are stored on
     no face, for instance. Those are rejected there, each with its own reason; see
-    `gridutils.build_neighbor_maps` and `gridutils._OuterTopology`.
+    `sectionate.topology.CornerTopology`.
     """
     facedim = grid._facedim
     connections = (getattr(grid, "_face_connections", None) or {}).get(facedim, {})
@@ -370,139 +404,7 @@ def _check_supported_topology(grid):
                         "padding={'Y': {'fold': 'corner'}} for a bipolar/tripolar north fold."
                     )
 
-def create_section_composite(
-    gridlon,
-    gridlat,
-    lons,
-    lats,
-    neighbor_maps,
-    curve="great circle",
-    ):
-    """
-    Compute composite section along velocity faces, as defined by coordinates of vorticity points (gridlon, gridlat),
-    that most closely approximates geodesic paths between consecutive points defined by (lons, lats).
 
-    PARAMETERS:
-    -----------
-
-    gridlon: np.ndarray
-        Array of longitude, in degrees. 2d (Y, X) for single-tile grids; 3d (face, Y, X) for
-        multi-tile grids (`face_connections`).
-    gridlat: np.ndarray
-        Array of latitude, in degrees, with the same shape as `gridlon`.
-    lons: list of float
-        longitude of section starting, intermediate and end points, in degrees
-    lats: list of float
-        latitude of section starting, intermediate and end points, in degrees
-    neighbor_maps: dict
-        Topology-aware neighbor maps from `sectionate.gridutils.build_neighbor_maps`
-        (single- or multi-tile). Sections are always built from an `xgcm.Grid`, so these
-        are always supplied; the usual entry point is `sectionate.grid_section`.
-    curve: str
-        Curve followed between consecutive vertices: "great circle" (default),
-        "latitude circle", or "latitude and great circle". Each segment is resolved and
-        checked independently; `sectionate.grid_section` documents what the three options
-        mean and which segments they reject.
-
-    RETURNS:
-    -------
-
-    i_c, j_c[, f_c], lons_c, lats_c: `np.ndarray`
-        (i_c, j_c[, f_c]) correspond to indices of vorticity points that define velocity faces;
-        the face index f_c is only returned for multi-tile grids.
-        (lons_c, lats_c) are the corresponding longitude and latitudes.
-    """
-
-    # A face dimension (3-D corner arrays) marks a multi-tile grid, whose sections
-    # carry a per-point face index. This is independent of `neighbor_maps`, which is
-    # now always provided for grid-derived sections (single- and multi-tile alike).
-    multitile = np.ndim(gridlon) == 3
-
-    i_c = np.array([], dtype=np.int64)
-    j_c = np.array([], dtype=np.int64)
-    f_c = np.array([], dtype=np.int64)
-    lons_c = np.array([], dtype=np.float64)
-    lats_c = np.array([], dtype=np.float64)
-
-    if len(lons) != len(lats):
-        raise ValueError("lons and lats should have the same length")
-
-    for k in range(len(lons) - 1):
-        seg = create_section(
-            gridlon,
-            gridlat,
-            lons[k],
-            lats[k],
-            lons[k + 1],
-            lats[k + 1],
-            neighbor_maps=neighbor_maps,
-            curve=curve,
-        )
-        if multitile:
-            i_c_seg, j_c_seg, f_c_seg, lons_c_seg, lats_c_seg = seg
-        else:
-            i_c_seg, j_c_seg, lons_c_seg, lats_c_seg = seg
-
-        i_c = np.concatenate([i_c, i_c_seg[:-1]], axis=0)
-        j_c = np.concatenate([j_c, j_c_seg[:-1]], axis=0)
-        lons_c = np.concatenate([lons_c, lons_c_seg[:-1]], axis=0)
-        lats_c = np.concatenate([lats_c, lats_c_seg[:-1]], axis=0)
-        if multitile:
-            f_c = np.concatenate([f_c, f_c_seg[:-1]], axis=0)
-
-    i_c = np.concatenate([i_c, [i_c_seg[-1]]], axis=0)
-    j_c = np.concatenate([j_c, [j_c_seg[-1]]], axis=0)
-    lons_c = np.concatenate([lons_c, [lons_c_seg[-1]]], axis=0)
-    lats_c = np.concatenate([lats_c, [lats_c_seg[-1]]], axis=0)
-    if multitile:
-        f_c = np.concatenate([f_c, [f_c_seg[-1]]], axis=0)
-        return i_c.astype(np.int64), j_c.astype(np.int64), f_c.astype(np.int64), lons_c, lats_c
-
-    return i_c.astype(np.int64), j_c.astype(np.int64), lons_c, lats_c
-
-def create_section(gridlon, gridlat, lonstart, latstart, lonend, latend, neighbor_maps, curve="great circle"):
-    """
-    Compute a section segment along velocity faces, as defined by coordinates of vorticity points (gridlon, gridlat),
-    that most closely approximates the geodesic path between points (lonstart, latstart) and (lonend, latend).
-
-    PARAMETERS:
-    -----------
-
-    gridlon: np.ndarray
-        2d array of longitude (with dimensions ("Y", "X")), in degrees
-    gridlat: np.ndarray
-        2d array of latitude (with dimensions ("Y", "X")), in degrees
-    lonstart: float
-        longitude of starting point, in degrees
-    lonend: float
-        longitude of end point, in degrees
-    latstart: float
-        latitude of starting point, in degrees
-    latend: float
-        latitude of end point, in degrees
-    neighbor_maps: dict
-        Topology-aware neighbor maps from `sectionate.gridutils.build_neighbor_maps`
-        (single- or multi-tile).
-
-    RETURNS:
-    -------
-
-    i_c, j_c[, f_c], lons_c, lats_c: `np.ndarray`
-        (i_c, j_c[, f_c]) correspond to indices of vorticity points that define velocity faces;
-        the face index f_c is only returned for multi-tile grids.
-        (lons_c, lats_c) are the corresponding longitude and latitudes.
-    """
-
-    return infer_grid_path_from_geo(
-        lonstart,
-        latstart,
-        lonend,
-        latend,
-        gridlon,
-        gridlat,
-        neighbor_maps=neighbor_maps,
-        curve=curve,
-    )
 
 def _wrapped_dlon(lon1, lon2):
     """Signed longitude change from `lon1` to `lon2`, wrapped into [-180, 180).
@@ -579,313 +481,6 @@ def _check_segment_span(lon1, lat1, lon2, lat2, curve):
     return segment_curve
 
 
-def infer_grid_path_from_geo(lonstart, latstart, lonend, latend, gridlon, gridlat, neighbor_maps, curve="great circle"):
-    """
-    Find the grid indices (and coordinates) of vorticity points that most closely approximates
-    the geodesic path between points (lonstart, latstart) and (lonend, latend).
-
-    PARAMETERS:
-    -----------
-
-    lonstart: float
-        longitude of section starting point, in degrees
-    latstart: float
-        latitude of section starting point, in degrees
-    lonend: float
-        longitude of section end point, in degrees
-    latend: float
-        latitude of section end point, in degrees
-    gridlon: np.ndarray
-        Array of longitude, in degrees. 2d (Y, X) for single-tile grids; 3d (face, Y, X) for
-        multi-tile grids (`face_connections`).
-    gridlat: np.ndarray
-        Array of latitude, in degrees, with the same shape as `gridlon`.
-    neighbor_maps: dict
-        Topology-aware neighbor maps from `sectionate.gridutils.build_neighbor_maps`
-        (single- or multi-tile).
-
-    RETURNS:
-    -------
-
-    i_c, j_c[, f_c], lons_c, lats_c: `np.ndarray`
-        (i_c, j_c[, f_c]) correspond to indices of vorticity points that define velocity faces;
-        the face index f_c is only returned for multi-tile grids.
-        (lons_c, lats_c) are the corresponding longitude and latitudes.
-    """
-
-    # This function is called once per segment, so it is where the section-wide `curve`
-    # request becomes the one curve this segment follows. Resolve it here, from the
-    # *requested* waypoints, rather than leaving it to `infer_grid_path`, which sees only
-    # the grid corners the waypoints snap to -- and whose latitudes can differ from the
-    # requested ones by up to half a cell.
-    segment_curve = _check_segment_span(lonstart, latstart, lonend, latend, curve)
-
-    multitile = np.ndim(gridlon) == 3
-    if multitile:
-        istart, jstart, fstart = find_closest_grid_point(lonstart, latstart, gridlon, gridlat)
-        iend, jend, fend = find_closest_grid_point(lonend, latend, gridlon, gridlat)
-    else:
-        istart, jstart = find_closest_grid_point(lonstart, latstart, gridlon, gridlat)
-        iend, jend = find_closest_grid_point(lonend, latend, gridlon, gridlat)
-        fstart, fend = None, None
-
-    return infer_grid_path(
-        istart,
-        jstart,
-        iend,
-        jend,
-        gridlon,
-        gridlat,
-        neighbor_maps=neighbor_maps,
-        curve=segment_curve,
-        f1=fstart,
-        f2=fend,
-    )
-
-
-def infer_grid_path(i1, j1, i2, j2, gridlon, gridlat, neighbor_maps, f1=None, f2=None, curve="great circle"):
-    """
-    Find the grid indices (and coordinates) of vorticity points that most closely approximate
-    the geodesic path between the starting and ending corner points.
-
-    PARAMETERS:
-    -----------
-
-    i1: integer
-        i-coord of point1
-    j1: integer
-        j-coord of point1
-    i2: integer
-        i-coord of point2
-    j2: integer
-        j-coord of point2
-    gridlon: np.ndarray
-        Array of longitude, in degrees. 2d (Y, X) for single-tile grids; 3d (face, Y, X) for
-        multi-tile grids (`face_connections`).
-    gridlat: np.ndarray
-        Array of latitude, in degrees, with the same shape as `gridlon`.
-    neighbor_maps: dict
-        Topology-aware neighbor maps from `sectionate.gridutils.build_neighbor_maps`. The
-        grid's full topology (periodic wrap, fill/extend walls, multi-tile face seams, and
-        the bipolar north fold) is encoded here, so a grid is always required to produce
-        them -- typically via `sectionate.grid_section`.
-    f1, f2: integer or None
-        Face indices of the starting and ending points (multi-tile grids only); None otherwise.
-    curve: str
-        Curve this segment follows; see `sectionate.grid_section`. "latitude and great
-        circle" resolves here from the two endpoint corners' latitudes, since this entry
-        point is given indices rather than requested waypoints.
-
-    RETURNS:
-    -------
-
-    For single-tile grids:
-        i_c_seg, j_c_seg, lons_c_seg, lats_c_seg
-    For multi-tile grids, additionally the face index of each point:
-        i_c_seg, j_c_seg, f_c_seg, lons_c_seg, lats_c_seg
-
-    (i_c_seg, j_c_seg[, f_c_seg]) are the vorticity-point indices bounded by the start and end
-    points; (lons_c_seg, lats_c_seg) are the corresponding longitude and latitude.
-    """
-    if isinstance(gridlon, xr.core.dataarray.DataArray):
-        gridlon = gridlon.values
-    if isinstance(gridlat, xr.core.dataarray.DataArray):
-        gridlat = gridlat.values
-
-    if neighbor_maps is None:
-        raise ValueError(
-            "infer_grid_path requires topology-aware `neighbor_maps`. Build them from an "
-            "xgcm.Grid with sectionate.gridutils.build_neighbor_maps(grid, get_geo_corners(grid)), "
-            "or use the high-level sectionate.grid_section(grid, lons, lats)."
-        )
-
-    multitile = gridlon.ndim == 3
-    if multitile:
-        nfaces, ny, nx = gridlon.shape
-    else:
-        ny, nx = gridlon.shape
-        nfaces = 1
-
-    def coord(arr, f, j, i):
-        return arr[j, i] if f is None else arr[f, j, i]
-
-    def neighbor(direction, f, j, i):
-        fmap, jmap, imap = neighbor_maps[direction]
-        if fmap is None:
-            return (None, int(jmap[j, i]), int(imap[j, i]))
-        return (int(fmap[f, j, i]), int(jmap[f, j, i]), int(imap[f, j, i]))
-
-    # target coordinates
-    lon1, lat1 = coord(gridlon, f1, j1, i1), coord(gridlat, f1, j1, i1)
-    lon2, lat2 = coord(gridlon, f2, j2, i2), coord(gridlat, f2, j2, i2)
-
-    segment_curve = _segment_curve(lat1, lat2, curve)
-
-    # Per-curve metrics used by the deterministic neighbor selection below.
-    #  - progress(lon, lat): remaining distance to the segment endpoint (smaller = nearer);
-    #    admits only neighbors that do not move away from the endpoint.
-    #  - deviation(lon, lat): how far a candidate lies from the desired curve between the
-    #    endpoints (smaller = better); chooses among admitted neighbors. It is symmetric in
-    #    the two endpoints so the path does not depend on travel direction, and is in radians
-    #    for both curve types so WALK_DEVIATION_ATOL is meaningful for both.
-    # Physical coincidence with the endpoint (the seam-twin stop) always uses true geodesic
-    # distance, independent of `curve`.
-    if segment_curve == "great circle":
-        def progress(lon, lat):
-            return distance_on_unit_sphere(lon, lat, lon2, lat2)
-        def deviation(lon, lat):
-            return (spherical_angle(lon2, lat2, lon1, lat1, lon, lat)
-                    + spherical_angle(lon1, lat1, lon2, lat2, lon, lat))
-    else:   # "latitude circle" -- the only other value `_segment_curve` returns
-        # Progress purely in longitude, deviation purely in latitude: the metrics of a
-        # march along a parallel, and meaningful only for a segment whose endpoints share
-        # a latitude. Segments that do not are never resolved to this curve.
-        def progress(lon, lat):
-            # sin^2(delta-lon/2) is the haversine of the longitude gap: periodic in 360
-            # degrees and monotonic in |delta-lon| up to 180, so it measures the *shortest*
-            # way round regardless of how the endpoint longitudes were written (0 -> 270
-            # descends westward just as 0 -> -90 does). Direction-symmetric.
-            return np.sin(np.deg2rad((lon - lon2) / 2.)) ** 2
-        def deviation(lon, lat):
-            # angular distance off the constant-latitude curve through the endpoints
-            # (radians). Flat between the two endpoint latitudes, which absorbs the
-            # sub-cell mismatch left when each endpoint snaps to its nearest grid corner.
-            return np.deg2rad(abs(lat - lat1)) + np.deg2rad(abs(lat - lat2))
-
-    def order_key(pt):
-        _f, _j, _i = pt
-        return (-1 if _f is None else _f, _j, _i)
-
-    # init loop position to starting point
-    f, j, i = f1, j1, i1
-
-    i_c_seg = [i]  # add first point to list of points
-    j_c_seg = [j]  # add first point to list of points
-    f_c_seg = [f]  # add first point to list of points
-
-    # iterate through the grid path steps until we reach end of section
-    ct = 0 # grid path step counter
-    # safety bound: enough steps to cross the whole grid (all faces) once
-    nstep_max = (nx + ny + 1) * nfaces
-
-    # Grid-agnostic algorithm (see the per-step selection below):
-    # First, find all four neighbors (using grid topology via `neighbor_maps`).
-    # Second, keep those strictly closer to the endpoint (plus any seam twin of the current
-    #   point), excluding the previous point.
-    # Third, step to the admitted neighbor closest to the desired `curve`, with a
-    #   deterministic, direction-independent tie-break.
-    f_prev, j_prev, i_prev = f, j, i
-    while (f, j, i) != (f2, j2, i2):
-
-        # safety precaution: exit after taking enough steps to have crossed the entire model grid
-        if ct > nstep_max:
-            raise RuntimeError(f"Should have reached the endpoint by now.")
-
-        d_current = distance_on_unit_sphere(
-                coord(gridlon, f, j, i),
-                coord(gridlat, f, j, i),
-                lon2,
-                lat2
-            )
-
-        # We are done once we reach the endpoint. On grids where two distinct
-        # corner indices map to the same physical point -- the bipolar fold seam,
-        # where corner i is identified with its mirror image -- the walker can land
-        # on the endpoint's twin index rather than the endpoint index itself, so we
-        # also stop on physical coincidence. The tolerance (in metres) sits far below
-        # any real grid spacing yet well above the fold's float round-trip error.
-        if d_current < COINCIDENT_TOLERANCE_M:
-            break
-
-        here = (f, j, i)
-        neighbors = [
-            neighbor("right", f, j, i),
-            neighbor("left",  f, j, i),
-            neighbor("down",  f, j, i),
-            neighbor("up",    f, j, i),
-        ]
-        prev = (f_prev, j_prev, i_prev)
-        # A neighbor equal to the current index is an unconnected wall (`build_neighbor_maps`
-        # represents a wall as the point itself); never step onto it. Likewise never step
-        # back to the point we came from.
-        skip = {here, prev}
-
-        # Step straight onto the endpoint (or its physical twin across a seam) as soon as a
-        # neighbor coincides with it -- this also avoids the degenerate `deviation` evaluated
-        # exactly at the endpoint.
-        next_pt = None
-        for nb in neighbors:
-            if nb in skip:
-                continue
-            if distance_on_unit_sphere(
-                coord(gridlon, *nb), coord(gridlat, *nb), lon2, lat2
-            ) < COINCIDENT_TOLERANCE_M:
-                next_pt = nb
-                break
-
-        if next_pt is None:
-            # Admit a neighbor (other than the one we came from) if it gets us strictly
-            # closer to the endpoint, OR if it is a seam twin of the current point -- the
-            # same physical location reached by a different index across a periodic or fold
-            # seam. The twin is a valid zero-length step that does *not* reduce the distance,
-            # so a strict "closer than current" test admits it only depending on floating-point
-            # rounding (the bug that made paths flip across numpy/libm versions); admitting it
-            # explicitly by physical coincidence makes that deterministic, without admitting
-            # genuinely-distinct near-equidistant neighbors (which would wander off a normal
-            # path). Among the admitted neighbors take the one closest to the desired curve,
-            # breaking near-ties (within WALK_DEVIATION_ATOL) deterministically by index.
-            p_current = progress(coord(gridlon, f, j, i), coord(gridlat, f, j, i))
-            cur_lon, cur_lat = coord(gridlon, f, j, i), coord(gridlat, f, j, i)
-            cand = []
-            for nb in neighbors:
-                if nb in skip:
-                    continue
-                nb_lon, nb_lat = coord(gridlon, *nb), coord(gridlat, *nb)
-                seam_twin = distance_on_unit_sphere(nb_lon, nb_lat, cur_lon, cur_lat) < COINCIDENT_TOLERANCE_M
-                if (progress(nb_lon, nb_lat) < p_current) or seam_twin:
-                    dev = deviation(nb_lon, nb_lat)
-                    if np.isfinite(dev):
-                        cand.append((dev, order_key(nb), nb))
-            if cand:
-                best_dev = min(c[0] for c in cand)
-                next_pt = min(
-                    (c for c in cand if c[0] <= best_dev + WALK_DEVIATION_ATOL),
-                    key=lambda c: c[1],
-                )[2]
-            else:
-                # No admissible forward move (e.g. closing a fold): take the closest
-                # non-wall, non-previous neighbor, with a deterministic index tie-break.
-                alt = [nb for nb in neighbors if nb not in skip] or [nb for nb in neighbors if nb != prev]
-                next_pt = min(
-                    alt,
-                    key=lambda nb: (
-                        distance_on_unit_sphere(coord(gridlon, *nb), coord(gridlat, *nb), lon2, lat2),
-                        order_key(nb),
-                    ),
-                )
-
-        f_prev, j_prev, i_prev = f, j, i
-
-        f, j, i = next_pt
-
-        i_c_seg.append(i)
-        j_c_seg.append(j)
-        f_c_seg.append(f)
-
-        ct+=1
-
-    # create lat/lon vectors from (f,j,i) triples
-    lons_c_seg = []
-    lats_c_seg = []
-    for ff, jj, ji in zip(f_c_seg, j_c_seg, i_c_seg):
-        lons_c_seg.append(coord(gridlon, ff, jj, ji))
-        lats_c_seg.append(coord(gridlat, ff, jj, ji))
-
-    i_c, j_c = np.array(i_c_seg), np.array(j_c_seg)
-    lons_c, lats_c = np.array(lons_c_seg), np.array(lats_c_seg)
-    if multitile:
-        return i_c, j_c, np.array(f_c_seg), lons_c, lats_c
-    return i_c, j_c, lons_c, lats_c
 
 
 def find_closest_grid_point(lon, lat, gridlon, gridlat):

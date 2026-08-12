@@ -39,8 +39,8 @@ def _fine_grid(nx=24, ny=20, seed=0):
 def _assert_reverse_equal(grid, lon, lat, curve="great circle"):
     fwd = grid_section(grid, lon, lat, curve=curve)
     rev = grid_section(grid, lon[::-1], lat[::-1], curve=curve)
-    i, j, lo, la = fwd
-    i2, j2, lo2, la2 = rev
+    i, j, _f, lo, la = fwd
+    i2, j2, _f2, lo2, la2 = rev
     # The reverse traversal yields the forward path, reversed -- exactly.
     assert np.array_equal(i, i2[::-1]), f"i not reversible:\n{i}\n{i2[::-1]}"
     assert np.array_equal(j, j2[::-1]), f"j not reversible:\n{j}\n{j2[::-1]}"
