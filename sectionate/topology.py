@@ -681,15 +681,24 @@ class CornerTopology:
         """
         Every native storage of the velocity face between two adjacent corner nodes.
 
-        Each entry is ``(var, face, j, i, to_cell, from_cell)``: the velocity
-        component and its native index, plus the global tracer-cell ids its positive
-        direction points to and from *in its own face's frame*. Reading a face in the
-        frame it is stored in is what lets a rotated or reversed seam be crossed with
-        no vector rotation at all.
+        Each entry is ``(var, face, j, i, to_cell, from_cell, step, slots)``: the
+        velocity component and its native index, the global tracer-cell ids its
+        positive direction points to and from *in its own face's frame*, the step
+        ``(dJ, dI)`` from `node_a` to `node_b` in that same frame, and the pair of
+        corner slots it was read from. Reading a face in the frame it is stored in is
+        what lets a rotated or reversed seam be crossed with no vector rotation at
+        all.
+
+        The velocity and the step travel together on purpose. A seam that folds a row
+        onto itself stores one physical edge twice, in mirrored frames and therefore
+        with opposite sign -- the duplicated, sign-flipped row of an ORCA-style fold.
+        Taking the velocity from one spelling and the direction of travel from the
+        other would make a section that runs out and back along such a row fail to
+        cancel, so a caller must use one entry whole rather than mix two.
 
         A seam face is usually stored once, on whichever face's low edge it is; a
-        face across a boundary fold can be stored twice; a face on an edge no array
-        covers is stored not at all, and the list is empty.
+        face along a boundary fold is stored twice; a face on an edge no array covers
+        is stored not at all, and the list is empty.
         """
         t, Nyc, Nxc = self.t, self.Nyc, self.Nxc
         reps_b = {}
@@ -708,16 +717,22 @@ class CornerTopology:
                         return (f * Nyc + jc) * Nxc + ic
                     return None
 
+                step = (Jb - Ja, Ib - Ia)
+                slots = ((f, Ja, Ia), (f, Jb, Ib))
                 if Ia == Ib:      # a vertical lattice edge: an X-direction velocity
                     jc, I = min(Ja, Jb), Ia
                     i = I - t
                     if 0 <= i < self.nxq and 0 <= jc < Nyc:
-                        out.append(("U", f, jc, i, gid(jc, I), gid(jc, I - 1)))
+                        out.append(
+                            ("U", f, jc, i, gid(jc, I), gid(jc, I - 1), step, slots)
+                        )
                 else:             # a horizontal lattice edge: a Y-direction velocity
                     J, ic = Ja, min(Ia, Ib)
                     j = J - t
                     if 0 <= j < self.nyq and 0 <= ic < Nxc:
-                        out.append(("V", f, j, ic, gid(J, ic), gid(J - 1, ic)))
+                        out.append(
+                            ("V", f, j, ic, gid(J, ic), gid(J - 1, ic), step, slots)
+                        )
         return out
 
     @property

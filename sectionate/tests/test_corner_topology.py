@@ -302,12 +302,17 @@ def test_edge_velocities_name_the_stored_face_and_the_cells_it_separates(cube_gr
     for a, b in ct.edges[:200]:
         vels = ct.edge_velocities(a, b)
         assert vels, f"edge {a}-{b} of the corner graph has no stored velocity"
-        for var, f, j, i, to_cell, from_cell in vels:
+        for var, f, j, i, to_cell, from_cell, step, slots in vels:
             assert var in ("U", "V")
             assert to_cell != from_cell
-    # the relation is symmetric in the two nodes
-    a, b = ct.edges[7]
-    assert ct.edge_velocities(a, b) == ct.edge_velocities(b, a)
+            assert abs(step[0]) + abs(step[1]) == 1
+
+    # The same face either way round, but the step through it reverses -- which is
+    # what carries the sign, so the two must not be conflated.
+    a, b = (int(x) for x in ct.edges[7])
+    fwd, back = ct.edge_velocities(a, b), ct.edge_velocities(b, a)
+    assert [v[:6] for v in fwd] == [v[:6] for v in back]
+    assert [v[6] for v in fwd] == [(-dJ, -dI) for dJ, dI in (v[6] for v in back)]
 
 
 def test_positions_validate_against_the_topology_without_deciding_it():

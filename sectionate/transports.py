@@ -210,13 +210,22 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
                 "is stored on none of its arrays. A section must step from each "
                 "corner to an adjacent one."
             )
-        # Prefer the storage on the face the section is already in, so a velocity is
-        # read in the frame it was written in and nothing has to be rotated.
-        pick = next((s for s in stored if s[1] == faces[k]), stored[0])
-        v, f, jv, iv, _to_cell, _from_cell = pick
+        # Read the face in the spelling the section was actually written in. Where a
+        # fold stores one edge twice, the two copies sit in mirrored frames and carry
+        # opposite signs, so a section that runs out and back along such a row only
+        # cancels if each traversal is read in its own frame. Falling back to the
+        # section's face, and then to any storage, covers a crossing written in the
+        # frame it is leaving.
+        want = (
+            (int(faces[k]), int(j_c[k]) + t, int(i_c[k]) + t),
+            (int(faces[k + 1]), int(j_c[k + 1]) + t, int(i_c[k + 1]) + t),
+        )
+        pick = next(
+            (s for s in stored if s[7] == want),
+            next((s for s in stored if s[1] == faces[k]), stored[0]),
+        )
+        v, f, jv, iv, _to_cell, _from_cell, step, _slots = pick
 
-        # The section's direction of travel, in the frame that holds the velocity.
-        step = _travel_in_face(topology, a, b, f)
         if v == "U":
             # `+x` velocity: it points left of travel when travel runs in `-y`.
             s = -1 if step[0] > 0 else 1
@@ -246,22 +255,6 @@ def uvindices_from_qindices(grid, i_c, j_c, f_c=None):
         uvindices["face"] = np.array(vface, dtype=np.int64)
     return uvindices
 
-
-def _travel_in_face(topology, node_a, node_b, face):
-    """The step from `node_a` to `node_b` as `(dJ, dI)` in `face`'s own frame."""
-    reps_b = {
-        (int(J), int(I))
-        for f, J, I in topology.reps_of(node_b) if int(f) == face
-    }
-    for f, Ja, Ia in topology.reps_of(node_a):
-        if int(f) != face:
-            continue
-        for Jb, Ib in reps_b:
-            if abs(int(Ja) - Jb) + abs(int(Ia) - Ib) == 1:
-                return (Jb - int(Ja), Ib - int(Ia))
-    raise ValueError(  # pragma: no cover - `edge_velocities` found the pair already
-        f"Corners {node_a} and {node_b} are not adjacent on face {face}."
-    )
 
 
 def _legacy_uvindices_from_qindices(grid, i_c, j_c, f_c=None):
