@@ -105,7 +105,7 @@ def test_fold_section_crosses_arctic_on_real_grid():
 
     fold = xgcm.Grid(ds, coords=coords, padding={"X": "periodic", "Y": {"fold": "corner"}},
                      autoparse_metadata=False)
-    i_c, j_c, lons_c, lats_c = grid_section(fold, lons, lats)
+    i_c, j_c, _f, lons_c, lats_c = grid_section(fold, lons, lats)
     # The traced path hugs the requested latitude (it did not wander off the seam).
     assert np.all(np.abs(np.asarray(lats_c) - 80.0) < 1.0)
     # It reaches the northern fold row.
@@ -299,7 +299,7 @@ def test_fold_crossing_transport_is_exact_on_real_tripolar_grid():
         "meridional over pole": ([100.0, 100.0, 280.0, 280.0], [60.0, 89.0, 89.0, 60.0], "great circle"),
     }
     for name, (lons, lats, curve) in sections.items():
-        i_c, j_c, _, _ = grid_section(grid, lons, lats, curve=curve)
+        i_c, j_c, _f, _, _ = grid_section(grid, lons, lats, curve=curve)
         assert j_c.max() == ds.yq.size - 1, f"{name} never reached the seam"
 
         got = _section_transport(tgrid, i_c, j_c)

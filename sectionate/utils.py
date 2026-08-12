@@ -139,10 +139,12 @@ def save_gridded_section(filepath, gridded_section):
         "lats_c": [float(x) for x in gridded_section.lats_c],
         "i_c": [int(x) for x in gridded_section.i_c],
         "j_c": [int(x) for x in gridded_section.j_c],
-        # Face indices are needed to reload a multi-tile section correctly; None for
-        # single-tile grids.
-        "f_c": (None if gridded_section.f_c is None
-                else [int(x) for x in gridded_section.f_c]),
+        # The face each corner belongs to. A single-tile grid is one face, so this is
+        # zeros rather than absent -- what is written does not depend on the shape of
+        # the grid. Node ids are deliberately *not* written: they are an artefact of
+        # how the topology was built, so a stored one could disagree with the grid it
+        # is loaded against. They are re-derived on load instead.
+        "f_c": [int(x) for x in gridded_section.f_c],
     }
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2)
@@ -174,5 +176,5 @@ def load_gridded_section(filepath, grid):
         grid,
         i_c=data["i_c"],
         j_c=data["j_c"],
-        f_c=data.get("f_c"),  # absent in files written before f_c was persisted -> None
+        f_c=data["f_c"],
     )

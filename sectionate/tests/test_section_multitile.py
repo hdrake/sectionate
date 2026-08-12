@@ -304,7 +304,7 @@ def test_within_face_transport_matches_single_tile():
 
     # Same section + transports on the standalone face-0 grid must agree exactly.
     slab = _single_face_slab(grid, 0)
-    i0, j0, lons0, lats0 = grid_section(slab, lonseg, latseg)
+    i0, j0, _f, lons0, lats0 = grid_section(slab, lonseg, latseg)
     assert np.array_equal(i, i0) and np.array_equal(j, j0)
     conv_st = convergent_transport(
         slab, i0, j0, utr="u", vtr="v", geometry="cartesian"
@@ -325,7 +325,7 @@ def test_within_face_tracer_matches_single_tile():
 
     slab = _single_face_slab(grid, 0)
     slab._ds["theta"] = grid._ds["theta"].isel({grid._facedim: 0}).drop_vars(grid._facedim)
-    i0, j0, lons0, lats0 = grid_section(slab, lonseg, latseg)
+    i0, j0, _f, lons0, lats0 = grid_section(slab, lonseg, latseg)
     tr_st = extract_tracer("theta", slab, i0, j0).values
 
     assert np.allclose(tr_mt, tr_st, equal_nan=True)
@@ -403,7 +403,7 @@ def test_seam_crossing_transport_matches_uncut_grid():
     lonseg = np.array([10., 70., 70., 10., 10.])
     latseg = np.array([-20., -20., 20., 20., -20.])
 
-    i, j, lons, lats = grid_section(single, lonseg, latseg)
+    i, j, _f, lons, lats = grid_section(single, lonseg, latseg)
     conv_single = convergent_transport(
         single, i, j, utr="u", vtr="v", geometry="cartesian"
     )["conv_mass_transport"].sum().values
@@ -466,7 +466,7 @@ def test_nonsymmetric_seam_transport_matches_uncut_grid():
     single, split = _matched_single_and_split_nonsym()
     lonseg = np.array([15., 65., 65., 15., 15.])
     latseg = np.array([-15., -15., 15., 15., -15.])
-    i, j, lons, lats = grid_section(single, lonseg, latseg)
+    i, j, _f, lons, lats = grid_section(single, lonseg, latseg)
     conv_single = convergent_transport(
         single, i, j, utr="u", vtr="v", geometry="cartesian"
     )["conv_mass_transport"].sum().values

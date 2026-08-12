@@ -108,12 +108,12 @@ def test_axis_aligned_sections_take_one_step_per_cell():
     from sectionate.section import grid_section
 
     grid = _latlon_grid()
-    i, j, lons, lats = grid_section(grid, [0., 179.], [0., 0.])
+    i, j, _f, lons, lats = grid_section(grid, [0., 179.], [0., 0.])
     assert len(i) == 180
     assert np.array_equal(lons, np.arange(0., 180.))
     assert np.all(lats == 0.)
 
-    i, j, lons, lats = grid_section(grid, [0., 0.], [-80., 80.])
+    i, j, _f, lons, lats = grid_section(grid, [0., 0.], [-80., 80.])
     assert len(j) == 161
     assert np.array_equal(lats, np.arange(-80., 81.))
     assert np.all(lons == 0.)
@@ -133,7 +133,7 @@ def test_crossing_the_periodic_seam_emits_one_face_per_cell_crossed():
     from sectionate.topology import corner_topology
 
     grid = _latlon_grid()
-    i, j, lons, lats = grid_section(grid, [355., 5.], [0., 0.])
+    i, j, _f, lons, lats = grid_section(grid, [355., 5.], [0., 0.])
     ct = corner_topology(grid)
     nodes = ct.node_id[0, j + ct.t, i + ct.t]
     repeats = int((nodes[1:] == nodes[:-1]).sum())

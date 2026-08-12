@@ -158,8 +158,8 @@ def test_left_transport_matches_outer():
     lonseg = np.array([15., 60., 60., 15., 15.])
     latseg = np.array([-30., -30., 15., 15., -30.])
 
-    io, jo, lo, lao = grid_section(outer, lonseg, latseg)
-    il, jl, ll, lal = grid_section(left, lonseg, latseg)
+    io, jo, _f, lo, lao = grid_section(outer, lonseg, latseg)
+    il, jl, _f, ll, lal = grid_section(left, lonseg, latseg)
     # Same geographic section -> same corner-index path (left[k] == outer[k]).
     assert np.array_equal(io, il) and np.array_equal(jo, jl)
 
@@ -217,7 +217,7 @@ def test_left_multitile_seam_transport_matches_uncut_grid():
     lonseg = np.array([10., 60., 60., 10., 10.])
     latseg = np.array([-15., -15., 15., 15., -15.])
 
-    i, j, lons, lats = grid_section(single, lonseg, latseg)
+    i, j, _f, lons, lats = grid_section(single, lonseg, latseg)
     conv_single = convergent_transport(
         single, i, j, utr="u", vtr="v", geometry="cartesian"
     )["conv_mass_transport"].sum().values
@@ -244,8 +244,8 @@ def test_left_tracer_matches_outer():
 
     lonseg = np.array([15., 60., 60., 15., 15.])
     latseg = np.array([-30., -30., 15., 15., -30.])
-    io, jo, lo, lao = grid_section(outer, lonseg, latseg)
-    il, jl, ll, lal = grid_section(left, lonseg, latseg)
+    io, jo, _f, lo, lao = grid_section(outer, lonseg, latseg)
+    il, jl, _f, ll, lal = grid_section(left, lonseg, latseg)
     tr_o = extract_tracer("theta", outer, io, jo).values
     tr_l = extract_tracer("theta", left, il, jl).values
     assert np.allclose(tr_o, tr_l, equal_nan=True)

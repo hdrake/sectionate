@@ -43,7 +43,7 @@ def test_convergent_transport():
     # closed path around the whole square domain
     lonseg = np.array([0, 1, 1, 0, 0])
     latseg = np.array([0, 0, 1, 1, 0])
-    i, j, lons, lats = grid_section(grid, lonseg, latseg)
+    i, j, _f, lons, lats = grid_section(grid, lonseg, latseg)
 
     conv = convergent_transport(
         grid,
@@ -126,7 +126,7 @@ def test_open_section_left_of_transect():
     grid._ds['v'] = xr.DataArray(np.ones((3, 3)), dims=("yq", "xh"))
 
     # Open, eastward (west -> east) zonal section along the interior corner row y=1.
-    i, j, lons, lats = grid_section(grid, [0., 3.], [1., 1.])
+    i, j, _f, lons, lats = grid_section(grid, [0., 3.], [1., 1.])
 
     def total(i_c, j_c, positive_in=True):
         with warnings.catch_warnings():
@@ -162,7 +162,7 @@ def test_convergent_transport_convention():
     lonseg = np.array([0., -120., -240., -360.])
     latseg = np.array([0., 0., 0., 0.])
     
-    i, j, lons, lats = grid_section(grid, lonseg, latseg)
+    i, j, _f, lons, lats = grid_section(grid, lonseg, latseg)
     conv = convergent_transport(
         grid,
         i,

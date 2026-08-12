@@ -153,12 +153,26 @@ class GriddedSection(Section):
             parent = section.parent
         )
         self.grid = grid
-        self.f_c = f_c
         if isinstance(i_c, (list, np.ndarray)) & isinstance(j_c, (list, np.ndarray)):
-            self.i_c = i_c
-            self.j_c = j_c
+            self.i_c = np.asarray(i_c, dtype=np.int64)
+            self.j_c = np.asarray(j_c, dtype=np.int64)
+            self.f_c = (np.zeros_like(self.i_c) if f_c is None
+                        else np.asarray(f_c, dtype=np.int64))
+            self._resolve_nodes()
         else:
             self.grid_section()
+
+    def _resolve_nodes(self):
+        """Which physical corner each index triple denotes, on this grid.
+
+        Always derived, never stored: a node id is an artefact of how the topology
+        was built, so a saved one could disagree with the grid it is loaded against.
+        Deriving it is also what lets a section built by hand, or reloaded from
+        indices, behave exactly like one this package traced.
+        """
+        from .topology import corner_topology
+        ct = corner_topology(self.grid)
+        self.n_c = ct.node_id[self.f_c, self.j_c + ct.t, self.i_c + ct.t]
 
     def grid_section(self, **kwargs):
         """Pass this Section's coordinates to sectionate.grid_section
@@ -177,12 +191,8 @@ class GriddedSection(Section):
             self.lats_c,
             **kwargs
         )
-        if len(out) == 5:
-            self.i_c, self.j_c, self.f_c, self.lons_c, self.lats_c = out
-        else:
-            self.i_c, self.j_c, self.lons_c, self.lats_c = out
-            self.f_c = None
-
+        self.i_c, self.j_c, self.f_c, self.lons_c, self.lats_c = out
+        self._resolve_nodes()
         return out
     
     def copy(self):
@@ -193,7 +203,7 @@ class GriddedSection(Section):
             self.grid,                  # shared, not copied
             i_c=self.i_c.copy(),
             j_c=self.j_c.copy(),
-            f_c=None if self.f_c is None else self.f_c.copy(),
+            f_c=self.f_c.copy(),
         )
         # Carry over the gridded path coordinates (grid_section overwrites lons_c/lats_c
         # in place; `__init__` would otherwise reset them to the raw waypoint coords).
@@ -299,10 +309,12 @@ def grid_section(grid, lons, lats, curve="great circle"):
 
     Returns
     -------
-    i_c, j_c[, f_c], lons_c, lats_c: `np.ndarray`
-        (i_c, j_c) correspond to indices of vorticity points that define velocity faces. For
-        multi-tile grids, the face index f_c of each point is returned as well.
-        (lons_c, lats_c) are the corresponding longitude and latitudes.
+    i_c, j_c, f_c, lons_c, lats_c: `np.ndarray`
+        (i_c, j_c, f_c) are the indices of the vorticity points that define the
+        section's velocity faces, and (lons_c, lats_c) their coordinates. `f_c` is
+        the face each point belongs to; a single-tile grid is one face, so it is all
+        zeros there rather than absent -- the shape of the answer does not depend on
+        the shape of the grid.
     """
     from .topology import corner_topology
     from .walk import find_closest_corner, infer_grid_path, native_path
@@ -346,9 +358,7 @@ def grid_section(grid, lons, lats, curve="great circle"):
     else:
         lons_c, lats_c = glon[f_c, j_c, i_c], glat[f_c, j_c, i_c]
 
-    if facedim is not None:
-        return i_c, j_c, f_c, lons_c, lats_c
-    return i_c, j_c, lons_c, lats_c
+    return i_c, j_c, f_c, lons_c, lats_c
 
 
 def _check_supported_topology(grid):
