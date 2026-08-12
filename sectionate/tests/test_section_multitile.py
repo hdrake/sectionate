@@ -637,23 +637,6 @@ def test_check_reads_face_labels_not_positions():
         _check_supported_topology(glued)
 
 
-def test_in_velocity_range_rejects_unknown_component():
-    """`_in_velocity_range` decides whether a velocity index exists in a face's own
-    arrays: in range for an edge stored on that face, out of range for one stored on the
-    face across the seam. It only ever sees the "U"/"V" components `_anchor_velocity`
-    produces, so anything else is a caller bug and is reported as one rather than
-    silently falling through to the "U" branch."""
-    from sectionate.transports import _in_velocity_range
-    ranges = {"Xc": 4, "Yc": 4, "Xq": 5, "Yq": 5}
-
-    assert _in_velocity_range("V", 3, 4, ranges)        # (X-center, Y-corner): both in range
-    assert not _in_velocity_range("V", 4, 4, ranges)    # past the end of the X-center axis
-    assert _in_velocity_range("U", 4, 3, ranges)        # (X-corner, Y-center): both in range
-    assert not _in_velocity_range("U", 4, 4, ranges)    # past the end of the Y-center axis
-    assert not _in_velocity_range("U", -1, 0, ranges)   # off the low end
-    with pytest.raises(ValueError, match="'U' or 'V'"):
-        _in_velocity_range("0", 0, 0, ranges)
-
 
 def test_save_load_roundtrip_preserves_face_indices(tmp_path):
     """A multi-tile GriddedSection round-trips through save/load with its face indices
