@@ -26,7 +26,10 @@ def find_closest_corner(lon, lat, topology):
     from .section import distance_on_unit_sphere
 
     nlon, nlat, known = topology._positions()
-    d = np.where(known, distance_on_unit_sphere(nlon, nlat, lon, lat), np.inf)
+    usable = known & topology.node_is_stored
+    if not usable.any():
+        usable = known
+    d = np.where(usable, distance_on_unit_sphere(nlon, nlat, lon, lat), np.inf)
     best = np.flatnonzero(d == d.min())
     if best.size == 1:
         return int(best[0])
@@ -102,9 +105,28 @@ def infer_grid_path(node1, node2, topology, curve="great circle"):
             return (np.deg2rad(abs(lat[n] - lat1))
                     + np.deg2rad(abs(lat[n] - lat2)))
 
+    stored = topology.node_is_stored
+
     def order_key(n):
         f, j, i = topology.node_native[n]
-        return (int(f), int(j), int(i), int(n))
+        # A corner stored on no face sorts last, so it is never the arbitrary pick
+        # among equals -- its native index is `(-1, -1, -1)`, which would otherwise
+        # sort it first.
+        return (0 if stored[n] else 1, int(f), int(j), int(i), int(n))
+
+    def writable(candidates):
+        """
+        Prefer corners the grid can name.
+
+        A corner stored on no face is a real corner and the walk may cross one, but a
+        section through it cannot be written in native indices. Where an equally good
+        route exists through corners that *are* stored, take it: nothing is lost
+        geometrically, and the section stays expressible. Cube vertices and the rows
+        a staggering drops are exactly this case, and they always have stored
+        neighbours.
+        """
+        keep = [m for m in candidates if stored[m]]
+        return keep or candidates
 
     members = _plateau_members(topology, plateau)
 
@@ -157,7 +179,7 @@ def infer_grid_path(node1, node2, topology, curve="great circle"):
             )
 
         p_here = progress(here)
-        admitted = [m for m in cands if progress(m) < p_here]
+        admitted = writable([m for m in cands if progress(m) < p_here])
         if admitted:
             devs = [(deviation(m), m) for m in admitted]
             devs = [(d, m) for d, m in devs if np.isfinite(d)] or devs
@@ -170,7 +192,7 @@ def infer_grid_path(node1, node2, topology, curve="great circle"):
             # Nothing gets closer (closing a fold, or hemmed in by a wall): take the
             # neighbour nearest the end point instead.
             nxt = min(
-                cands,
+                writable(cands),
                 key=lambda m: (
                     float(distance_on_unit_sphere(lon[m], lat[m], lon2, lat2)),
                     order_key(m),

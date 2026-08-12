@@ -132,8 +132,12 @@ def _pinched_fold_grid(nxh=16, ny=6):
     ``b_{ny-1} = 0``, so the top row collapses onto a segment traversed out and back.
     Under ``i <-> nxh - i`` that row is therefore *exactly* mirror-symmetric, which is
     the corner-pivot fold identity, with its two fold poles at ``i = 0`` and
-    ``i = nxh/2``. ``a_j`` grows with `j` so the ellipses nest and every corner below
-    the seam stays distinct.
+    ``i = nxh/2``.
+
+    *Both* semi-axes shrink with `j`, so the ellipses strictly nest and the map from
+    ``(i, j)`` to the sphere is orientable -- every cell has the same handedness. A
+    family whose `a_j` grew while `b_j` shrank would cross, leaving a fifth of the
+    cells inside out and their velocity faces signed backwards.
 
     Unlike `_fold_grid`, whose plain lat/lon coordinates do not carry the fold its
     metadata declares, this one is geometrically consistent with the fold, so
@@ -145,7 +149,7 @@ def _pinched_fold_grid(nxh=16, ny=6):
     def lonlat(jj, ii):
         theta = 2.0 * np.pi * np.asarray(ii) / nxh
         t = np.asarray(jj) / (ny - 1)
-        x = (1.0 + 0.5 * t) * np.cos(theta)
+        x = (1.0 - 0.5 * t) * np.cos(theta)
         y = (1.0 - t) * np.sin(theta)
         return 25.0 * x, 45.0 + 18.0 * y
 
@@ -232,13 +236,6 @@ def test_pinched_fold_grid_carries_the_fold_symmetry():
     assert np.abs(conv).max() < 1.0e-12
 
 
-# On this chart `+i` runs northward and `+j` eastward, so it is mirrored relative to
-# geography -- a deliberate stress case, and the only one in the suite that separates
-# index handedness from the world's. The streamfunction identity below is stated in
-# index space (`umo = psi[j,i] - psi[j+1,i]`), while `convergent_transport` reports
-# transport to the *left of travel*, which is a geographic side. On a mirrored chart
-# the two differ by a sign, so the expected value carries it explicitly.
-MIRRORED_CHART = -1
 
 
 def test_transport_crossing_the_fold_seam_is_exact():
@@ -259,7 +256,7 @@ def test_transport_crossing_the_fold_seam_is_exact():
         i_c = np.array([i0, i0, i0, mirror, mirror])
 
         got = _section_transport(grid, i_c, j_c)
-        want = MIRRORED_CHART * (psi[j_c[-1], i_c[-1]] - psi[j_c[0], i_c[0]])
+        want = psi[j_c[-1], i_c[-1]] - psi[j_c[0], i_c[0]]
         assert got == pytest.approx(want, abs=1.0e-12), f"column {i0}"
 
         # no velocity face is used twice, and the zero-length twin edge emits none
@@ -280,7 +277,7 @@ def test_transport_along_the_fold_seam_is_exact():
         i_c = np.concatenate([np.arange(i0, i1 + 1), [i1]])
         j_c = np.concatenate([np.full(i1 - i0 + 1, top), [top - 1]])
         got = _section_transport(grid, i_c, j_c)
-        want = MIRRORED_CHART * (psi[j_c[-1], i_c[-1]] - psi[j_c[0], i_c[0]])
+        want = psi[j_c[-1], i_c[-1]] - psi[j_c[0], i_c[0]]
         assert got == pytest.approx(want, abs=1.0e-12), f"columns {i0}..{i1}"
 
 
@@ -340,7 +337,7 @@ def test_zigzag_along_the_fold_seam_counts_each_face_once():
         j_c = np.array([top - 2, top - 1] + [top] * (i1 - i0 + 1) + [top - 1, top - 2])
 
         got = _section_transport(grid, i_c, j_c)
-        want = MIRRORED_CHART * (psi[j_c[-1], i_c[-1]] - psi[j_c[0], i_c[0]])
+        want = psi[j_c[-1], i_c[-1]] - psi[j_c[0], i_c[0]]
         assert got == pytest.approx(want, abs=1.0e-12), f"zigzag {i0}..{i1}"
 
         uv = uvindices_from_qindices(grid, i_c, j_c)
@@ -378,8 +375,7 @@ def test_degenerate_pole_column_is_crossed_deterministically():
     assert len(fwd[0]) == len(rev[0])
     for path in (fwd, rev):
         got = _section_transport(grid, path[0], path[1])
-        want = MIRRORED_CHART * (psi[path[1][-1], path[0][-1]]
-                                 - psi[path[1][0], path[0][0]])
+        want = psi[path[1][-1], path[0][-1]] - psi[path[1][0], path[0][0]]
         assert got == pytest.approx(want, abs=1.0e-12)
 
     # and every step really is one step: the walk did not jump the pole

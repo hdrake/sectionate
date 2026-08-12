@@ -6,7 +6,7 @@ import dask
 from .gridutils import (
     corner_offset, coord_dict, get_geo_corners, get_facedim,
 )
-from .section import distance_on_unit_sphere, COINCIDENT_TOLERANCE_M
+from .section import distance_on_unit_sphere
 
 
 
@@ -407,14 +407,6 @@ def convergent_transport(
     if facedim is not None:
         sect["face"] = xr.DataArray(uvindices["face"], dims=sect_coord)
     fsel = {facedim: sect["face"]} if facedim is not None else {}
-    sect["Usign"] = xr.DataArray(
-        np.array([1 if i else -1 for i in ~uvindices["Yinc"]]),
-        dims=sect_coord
-    )
-    sect["Vsign"] = xr.DataArray(
-        np.array([1 if i else -1 for i in uvindices["Xinc"]]),
-        dims=sect_coord
-    )
     sect["var"] = xr.DataArray(uvindices["var"], dims=sect_coord)
     sect["Umask"] = xr.DataArray(uvindices["var"]=="U", dims=sect_coord)
     sect["Vmask"] = xr.DataArray(uvindices["var"]=="V", dims=sect_coord)
@@ -422,7 +414,9 @@ def convergent_transport(
     # Per-edge sign: +1 if the velocity's positive direction points left of the
     # section's direction of travel. Both are read in the frame the velocity is
     # stored in, so a rotated or reversed seam needs no special case, and an edge
-    # whose two corners happen to coincide still gets a definite answer.
+    # whose two corners happen to coincide still gets a definite answer. This is the
+    # only sign there is now: the face-frame `Usign`/`Vsign` said the same thing on a
+    # single-tile grid and the wrong thing on any other, so they are gone.
     sect["Lsign"] = xr.DataArray(uvindices["Lsign"], dims=sect_coord)
 
     mask_types = (np.ndarray, dask.array.Array, xr.DataArray)
@@ -580,7 +574,7 @@ def is_section_counterclockwise(lons_c, lats_c, geometry="spherical"):
         lats_c = np.append(lats_c, lats_c[0])
     
     if geometry == "spherical":
-        X, Y = stereographic_projection(lons_c, lats_c)
+        X, Y = stereographic_projection(*_turned_away_from_the_pole(lons_c, lats_c))
     elif geometry == "cartesian":
         X, Y = lons_c, lats_c
     else:
@@ -590,6 +584,50 @@ def is_section_counterclockwise(lons_c, lats_c, geometry="spherical"):
     for i in range(X.size-1):
         signed_area += (X[i+1]-X[i])*(Y[i+1]+Y[i])
     return signed_area < 0.
+
+def _turned_away_from_the_pole(lons, lats):
+    """
+    Rotate a closed section so that none of its corners sits near the point the
+    stereographic projection is taken from.
+
+    The projection below sends the *north* pole to infinity (its radius is
+    `sin(phi)/(1 - cos(phi))`, which diverges as the colatitude goes to zero), so a
+    corner anywhere near it projects to a huge radius that swamps the signed area and
+    can flip the answer. A corner exactly at a geographic pole is not an exotic case
+    here but an ordinary one: it is where a tripolar cap's singular meridian ends,
+    and it is a vertex of every cell of an Arctic cap.
+
+    Turning the whole configuration first costs nothing and removes the problem: a
+    rotation does not change which way round a polygon runs, so the orientation this
+    returns is the same one, measured somewhere the projection behaves.
+    """
+    lo, la = np.deg2rad(np.asarray(lons, dtype=float)), np.deg2rad(np.asarray(lats, dtype=float))
+    v = np.stack([np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)], -1)
+
+    # Point the corners' mean direction at the south pole, which this projection
+    # sends to the origin -- as far from the singularity as they can collectively get.
+    m = v.mean(axis=0)
+    n = np.linalg.norm(m)
+    if n < 1.e-12:            # corners spread symmetrically: any turn is as good
+        return lons, lats
+    m = m / n
+    axis = np.cross(m, np.array([0.0, 0.0, -1.0]))
+    s = np.linalg.norm(axis)
+    if s < 1.e-12:            # already pointing at a pole
+        if m[2] < 0.0:
+            return lons, lats
+        v = v * np.array([1.0, -1.0, -1.0])          # a turn, not a reflection
+    else:
+        axis = axis / s
+        angle = np.arctan2(s, -m[2])
+        c, sn = np.cos(angle), np.sin(angle)
+        v = (v * c
+             + np.cross(axis, v) * sn
+             + axis * (v @ axis)[:, None] * (1.0 - c))     # Rodrigues
+
+    return (np.rad2deg(np.arctan2(v[:, 1], v[:, 0])),
+            np.rad2deg(np.arcsin(np.clip(v[:, 2], -1.0, 1.0))))
+
 
 def stereographic_projection(lons, lats):
     """

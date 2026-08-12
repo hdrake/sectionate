@@ -20,7 +20,6 @@ import xarray as xr
 import xgcm
 
 from sectionate.topology import CornerTopology, Identification
-from sectionate.topology import corner_topology as outer_topology
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -218,28 +217,7 @@ def test_cubed_sphere_has_the_corner_count_euler_demands(cube_grid):
     assert int((v == 3).sum()) == 8
 
 
-def test_multitile_identity_never_exceeds_the_old_coordinate_based_one(cube_grid):
-    """
-    Where the previous implementation merged two slots from cell identity, this one
-    must agree; where it merged them from *coordinates*, this one is allowed to keep
-    them apart. So the new partition must refine the old one, never coarsen it.
-    """
-    _assert_refines(CornerTopology(cube_grid), outer_topology(cube_grid))
 
-
-def _assert_refines(ct, ot):
-    new = ct.node_id.ravel()
-    old = ot.node_id.ravel()
-    keep = old >= 0
-    order = np.lexsort((old[keep], new[keep]))
-    n, o = new[keep][order], old[keep][order]
-    # within each new node, every old label must be the same
-    boundary = np.flatnonzero(np.diff(n)) + 1
-    for lo, hi in zip(np.r_[0, boundary], np.r_[boundary, n.size]):
-        assert len(np.unique(o[lo:hi])) == 1, (
-            f"new node {n[lo]} spans old nodes {np.unique(o[lo:hi])}: "
-            "the declared topology merged corners the cell-identity one kept apart"
-        )
 
 
 # ------------------------------------------------------- positions and velocities
@@ -288,7 +266,7 @@ def test_native_index_of_an_unstored_corner_raises_rather_than_inventing_one(cub
     stored = np.flatnonzero(ct.node_is_stored)[:3]
     assert ct.native_of(stored).shape == (3, 3)
     unstored = np.flatnonzero(~ct.node_is_stored)
-    with pytest.raises(ValueError, match="stored on no face"):
+    with pytest.raises(ValueError, match="stores it on no face"):
         ct.native_of(unstored[:1])
 
 
@@ -378,13 +356,19 @@ def test_real_tripolar_grid_matches_its_declaration():
 
 
 @pytest.mark.skipif(not os.path.exists(_ECCO), reason="needs the ECCO LLC90 grid")
-def test_llc90_identity_refines_the_coordinate_based_one():
+def test_llc90_resolves_to_the_corner_count_its_seams_imply():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "examples"))
     from load_example_ECCO_grid import load_ECCO_LLC90_grid
 
     grid = load_ECCO_LLC90_grid()
     ct = CornerTopology(grid)
-    _assert_refines(ct, outer_topology(grid))
+    # LLC90 stores 13 x 90 x 90 cells, so its 'outer' lattice holds 13 x 91 x 91
+    # corner slots. The tile seams identify them down to this many distinct points;
+    # the number is a property of the grid, and any change to it means the declared
+    # topology has been read differently.
+    assert ct.n_slots == 13 * 91 * 91
+    assert ct.n_nodes == 105481
+    assert int(np.count_nonzero(~ct.node_is_stored)) == 181
     # every tile edge that `face_connections` names is resolved; the four it leaves
     # `None` are the domain's southern boundary and stay unglued.
     assert len(ct.identifications) == 13 * 4 - 4

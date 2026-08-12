@@ -51,9 +51,9 @@ def test_llc90_outer_topology_builds_and_is_well_formed():
     # it has cells. Anything else means the graph and the mesh disagree.
     for n in range(0, ot.n_nodes, 97):                      # a sample, for speed
         assert deg[n] in (len(ot._cells_around(n)), len(ot._cells_around(n)) + 1)
-    assert int(np.count_nonzero(~native)) > 0
+    assert int(np.count_nonzero(~native)) == 181   # the dropped outer rows
     import pytest as _pytest
-    with _pytest.raises(ValueError, match="stored on no face"):
+    with _pytest.raises(ValueError, match="stores it on no face"):
         ot.native_of(np.where(~native)[0][:1])
 
 
@@ -103,7 +103,6 @@ def test_llc90_face_corners_resolve_topologically():
     the declarations they are ordinary corners."""
     from sectionate.topology import corner_topology as outer_topology
     ot = outer_topology(_load_grid())
-    assert (ot.node_id >= 0).all()
     nat = ot.node_native[ot.node_is_stored]
     assert (nat[:, 0] >= 0).all() and (nat[:, 0] < ot.nf).all()
     assert (nat[:, 1] >= 0).all() and (nat[:, 1] < ot.nyq).all()

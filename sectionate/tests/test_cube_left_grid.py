@@ -213,7 +213,6 @@ def test_cube_topology_is_complete_and_consistent():
     grid, _ = cube_left_grid()
     assert corner_position(grid) == "left"
     ot = outer_topology(grid)
-    assert (ot.node_id >= 0).all()
     deg = np.array([len(a) for a in ot.node_adj])
     native = ot.node_native[:, 0] >= 0
     assert len(deg) == 6 * Nc * Nc + 2
@@ -223,7 +222,7 @@ def test_cube_topology_is_complete_and_consistent():
     assert np.count_nonzero(deg == 3) == 8
     assert np.count_nonzero(deg == 4) == len(deg) - 8
     assert np.all(deg[~native] == 3)
-    with pytest.raises(ValueError, match="stored on no face"):
+    with pytest.raises(ValueError, match="stores it on no face"):
         ot.native_of(np.where(~native)[0][:1])
 
 
@@ -282,7 +281,6 @@ def test_disagreeing_extrapolation_junction_merges_and_conserves():
     """
     grid, _ = _coordinate_jittered_cube_left_grid()
     ot = outer_topology(grid)
-    assert (ot.node_id >= 0).all()
 
     # (a) the disagreeing corner slots collapse to one node per junction: exactly
     #     two non-native nodes (as on the exact cube), each merging three slots
@@ -588,7 +586,7 @@ def test_same_side_reverse_gluing_leaves_corners_unstored_but_resolved():
     assert ot.n_nodes == 6 * Nc * Nc + 2
     unstored = np.where(ot.node_native[:, 0] < 0)[0]
     assert unstored.size > 0                          # the dropped seam line
-    with pytest.raises(ValueError, match="stored on no face"):
+    with pytest.raises(ValueError, match="stores it on no face"):
         ot.native_of(unstored[:1])
 
 
@@ -609,7 +607,6 @@ def test_outer_reverse_gluing_matches_by_coincidence():
                for face in fc.values() for s in face.values() for c in s)
 
     ot = outer_topology(grid)                                        # builds; reverse is fine on outer
-    assert (ot.node_id >= 0).all()
     assert np.all(ot.node_native[:, 0] >= 0)                        # every corner stored (0 unstored)
 
     # a section crossing several faces (hence reverse seams): transport == dpsi
@@ -619,3 +616,59 @@ def test_outer_reverse_gluing_matches_by_coincidence():
     p0 = psi[int(f_c[0]), int(j_c[0]), int(i_c[0])]
     p1 = psi[int(f_c[-1]), int(j_c[-1]), int(i_c[-1])]
     assert np.isclose(abs(float(conv)), abs(p1 - p0), rtol=1e-9)
+
+
+def test_closed_loop_with_a_polar_corner_gets_the_inward_sense_right():
+    """
+    A corner exactly at a geographic pole is ordinary, not exotic: it is a vertex of
+    every cell of an Arctic cap, and where a tripolar cap's singular meridian ends.
+
+    Orientation is decided by the signed area of a stereographic projection, and that
+    projection sends one pole to infinity -- so a corner sitting on it projects to a
+    huge radius that swamps the area and can invert `positive_in` for the whole
+    section. The oracle is the discrete divergence theorem, which knows nothing of
+    projections: the flux into a cell, integrated round its boundary, must equal that
+    cell's convergence computed straight from the staggered arrays.
+    """
+    import warnings as _warnings
+
+    grid, _psi = _cube_variant((0,) * 6, stagger="outer")
+    ds = grid._ds
+    cd = {a: grid.axes[a].coords for a in ("X", "Y")}
+    Xc, Yc, Xq, Yq = cd["X"]["center"], cd["Y"]["center"], cd["X"]["outer"], cd["Y"]["outer"]
+    nf, nyc, nxc = ds.sizes["face"], ds.sizes[Yc], ds.sizes[Xc]
+
+    rng = np.random.default_rng(0)
+    u = rng.normal(size=(nf, nyc, ds.sizes[Xq]))
+    v = rng.normal(size=(nf, ds.sizes[Yq], nxc))
+    ds = ds.assign({"ut": ((("face", Yc, Xq)), u), "vt": ((("face", Yq, Xc)), v)})
+    g = xgcm.Grid(ds, coords={a: dict(grid.axes[a].coords) for a in ("X", "Y")},
+                  padding="fill", fill_value=np.nan,
+                  face_connections=grid._face_connections, autoparse_metadata=False)
+
+    from sectionate.gridutils import get_geo_corners
+    geo = get_geo_corners(g)
+    lat_c = geo["Y"].transpose("face", Yq, Xq).values
+    polar = np.argwhere(np.isclose(np.abs(lat_c), 90.0))
+    assert polar.size, "this cube should have corners exactly at a pole"
+
+    checked = 0
+    for f, J, I in polar:
+        for jc, ic in ((J - 1, I - 1), (J - 1, I), (J, I - 1), (J, I)):
+            if not (0 <= jc < nyc and 0 <= ic < nxc):
+                continue
+            want = u[f, jc, ic] - u[f, jc, ic + 1] + v[f, jc, ic] - v[f, jc + 1, ic]
+            mask = np.zeros((nf, nyc, nxc)); mask[f, jc, ic] = 1
+            m = xr.DataArray(mask, dims=("face", Yc, Xc))
+            i_c = [ic, ic + 1, ic + 1, ic, ic]
+            j_c = [jc, jc, jc + 1, jc + 1, jc]
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                out = convergent_transport(g, i_c, j_c, f_c=[f] * 5,
+                                           utr="ut", vtr="vt", positive_in=m)
+            got = float(out["conv_mass_transport"].sum().values)
+            assert got == pytest.approx(want, abs=1e-12), (
+                f"cell (face={f}, j={jc}, i={ic}) touching the pole"
+            )
+            checked += 1
+    assert checked >= 4

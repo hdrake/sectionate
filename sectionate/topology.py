@@ -60,12 +60,6 @@ def _faced(da, dims, facedim):
     return da.transpose(facedim, ..., *dims).values
 
 
-def _flat_step(lon0, lat0, lon1, lat1):
-    """Displacement in a local flat (east, north) frame, in degrees, with longitudes
-    scaled by cos(lat) and wrapped across the dateline."""
-    dlon = ((lon1 - lon0 + 180.0) % 360.0) - 180.0
-    return dlon * np.cos(np.deg2rad(0.5 * (lat0 + lat1))), (lat1 - lat0)
-
 
 def _lonlat_to_xyz(lon, lat):
     """Positions on the unit sphere, so that comparing them is free of the
@@ -776,23 +770,32 @@ class CornerTopology:
         Yq, Xq = cd["Y"]["corner"], cd["X"]["corner"]
         lon = _faced(geo["X"], (Yq, Xq), self.facedim).astype(float)
         lat = _faced(geo["Y"], (Yq, Xq), self.facedim).astype(float)
+        # Measured on the sphere, not in a flat (east, north) frame: a local frame
+        # degenerates at a pole, where a single cell would then report the opposite
+        # handedness to the rest of its face. `(e_i x e_j) . r` is the same question
+        # asked in a way the pole does not break.
+        p = _lonlat_to_xyz(lon[:, :-1, :-1], lat[:, :-1, :-1])
+        ex = _lonlat_to_xyz(lon[:, :-1, 1:], lat[:, :-1, 1:]) - p
+        ey = _lonlat_to_xyz(lon[:, 1:, :-1], lat[:, 1:, :-1]) - p
+        cross = np.sum(np.cross(ex, ey) * p, axis=-1)
+
         handed = np.ones(self.nf, dtype=np.int64)
         for f in range(self.nf):
-            found = False
-            for j in range(self.nyq - 1):
-                for i in range(self.nxq - 1):
-                    p, px, py = (lat[f, j, i], lat[f, j, i + 1], lat[f, j + 1, i])
-                    if not (np.isfinite(p) and np.isfinite(px) and np.isfinite(py)):
-                        continue
-                    ex = _flat_step(lon[f, j, i], p, lon[f, j, i + 1], px)
-                    ey = _flat_step(lon[f, j, i], p, lon[f, j + 1, i], py)
-                    cross = ex[0] * ey[1] - ex[1] * ey[0]
-                    if abs(cross) > 1e-12:
-                        handed[f] = 1 if cross > 0 else -1
-                        found = True
-                        break
-                if found:
-                    break
+            c = cross[f][np.isfinite(cross[f])]
+            c = c[np.abs(c) > 1e-12]        # degenerate cells say nothing either way
+            if c.size == 0:
+                continue
+            pos, neg = int((c > 0).sum()), int((c < 0).sum())
+            if pos and neg:
+                raise ValueError(
+                    f"Face {f} is not consistently oriented: {pos} of its cells run "
+                    f"one way round and {neg} the other. A face is a chart of a piece "
+                    "of the sphere, so every cell of it must have the same handedness; "
+                    "cells that do not are inside out, and the velocity faces around "
+                    "them would be signed backwards. Check the corner coordinates -- "
+                    "this usually means two rows of them cross."
+                )
+            handed[f] = 1 if pos else -1
         self._handed = handed
         return handed
 
@@ -918,11 +921,19 @@ class CornerTopology:
                 f" (near lon={lon[n]:.3f}, lat={lat[n]:.3f})" if known[n] else ""
             )
             raise ValueError(
-                f"Corner node {n}{where} is a real grid corner but is stored on no "
-                "face, so it has no native (face, j, i) index. This happens where a "
-                "staggering drops the row an edge falls on, and at junctions such as "
-                "a cubed sphere's un-stored vertices. Work with the section's node "
-                "ids instead of its native indices here."
+                f"Corner node {n}{where} is a real grid corner, but this grid stores "
+                "it on no face, so it has no native (face, j, i) index to report.\n\n"
+                "A 'left' staggering drops each face's high corner row and a 'right' "
+                "one its low row, so a corner falling only on dropped rows is absent "
+                "from every array -- which happens along a seam where two faces meet "
+                "on the same side of their axes, and at a junction such as a cubed "
+                "sphere's un-stored vertices. The section itself is valid and its "
+                "node ids describe it exactly; it is only the native indices that "
+                "cannot.\n\n"
+                "Sections are routed around such corners wherever a stored "
+                "alternative exists, so reaching this means the path has no other "
+                "way through. Provide the grid in 'outer' staggering, which stores "
+                "every corner, or work with the section's node ids."
             )
         return self.node_native[nodes]
 
