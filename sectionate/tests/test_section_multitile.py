@@ -189,30 +189,39 @@ def test_left_grid_rotated_seam_neighbours_are_edge_adjacent():
             )
 
 
-def test_cubed_sphere_is_resolved_or_refused_never_quietly_wrong():
+def test_cubed_sphere_closes_on_its_declared_connections():
     """
-    The cubed sphere's reversed and rotated connections are where a halo-derived
-    topology becomes unreliable, and this fixture is one that trips it: the seam maps
-    read back from the halo disagree with the `reverse` flags the grid declares.
+    The cubed sphere is where reversed and rotated gluings all appear at once, and
+    where reading a seam back out of a padded halo goes wrong: the halo does not
+    carry the declared reversal, and the resulting map folds a face onto itself,
+    merging two of the cube's vertices into one corner.
 
-    Either outcome is acceptable -- resolve the cube correctly, or refuse -- but not
-    the third one. Quietly merging two of the cube's vertices would hand their
-    velocity faces to the wrong corner, which is precisely the class of error that
-    resolving identity from declarations is meant to rule out.
+    Read from the declarations, the answer is forced and checkable against the
+    polyhedron: `6N^2 + 2` corners, of which exactly the 8 cube vertices have three
+    faces meeting at them, every corner has as many neighbours as it has cells, and
+    each of face 0's four edges is shared with the face the grid names.
     """
-    try:
-        ct = corner_topology(cubed_sphere())
-    except ValueError as err:
-        assert "same physical point" in str(err)
-        return
+    ct = corner_topology(cubed_sphere())
     N = ct.Nxc
-    assert ct.n_nodes == 6 * N * N + 2       # Euler, for a cube subdivided N x N
-    assert np.array_equal(ct.node_id[0, :, -1], ct.node_id[1, :, 0])
+    assert ct.n_nodes == 6 * N * N + 2
+    assert int((ct.valence == 3).sum()) == 8
+    assert int((ct.valence == 4).sum()) == 6 * N * N - 6
     for n in range(ct.n_nodes):
         assert len(ct._cells_around(n)) == ct.valence[n]
-    assert np.all(maps["left"][0][0][:, 0] == 3)
-    assert np.all(maps["up"][0][0][-1, :] == 5)
-    assert np.all(maps["down"][0][0][0, :] == 4)
+
+    # face 0's X neighbours are faces 3 (low) and 1 (high); its Y neighbours 4 and 5
+    edges = {
+        (3, "X"): ct.node_id[0, :, 0], (1, "X"): ct.node_id[0, :, -1],
+        (4, "Y"): ct.node_id[0, 0, :], (5, "Y"): ct.node_id[0, -1, :],
+    }
+    for (nbr, _axis), mine in edges.items():
+        theirs = np.concatenate([
+            ct.node_id[nbr, :, 0], ct.node_id[nbr, :, -1],
+            ct.node_id[nbr, 0, :], ct.node_id[nbr, -1, :],
+        ])
+        assert set(mine.tolist()) <= set(theirs.tolist()), (
+            f"face 0 does not share its edge with face {nbr}"
+        )
 
 
 # ---------------------------------------------------------------------------

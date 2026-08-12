@@ -77,13 +77,6 @@ def _lonlat_to_xyz(lon, lat):
     )
 
 
-# Directions on a face's own lattice, as (dJ, dI) steps.
-_STEPS = {"right": (0, 1), "left": (0, -1), "up": (1, 0), "down": (-1, 0)}
-
-# The four sides of a face, each as (axis, which_end).
-_SIDES = ("X_low", "X_high", "Y_low", "Y_high")
-
-
 class Identification:
     """
     One declared statement that two lines of corner slots are the same points.
@@ -330,125 +323,59 @@ class CornerTopology:
 
     # ------------------------------------------- multi-tile seam identifications
 
-    def _cell_neighbor_arrays(self):
-        """
-        Global tracer-cell ids, and each cell's neighbour across its four edges.
-
-        Padded one cell along a single axis at a time: a halo filled across two seams
-        at once (the diagonal corners of a two-axis pad) is a pad of a pad and is not
-        reliable, and nothing here needs it.
-        """
-        cd, ds = self.coords, self.grid._ds
-        Yc, Xc = cd["Y"]["center"], cd["X"]["center"]
-        if Yc is None or Xc is None:
-            raise ValueError(
-                "This grid has `face_connections` but no tracer-center coordinates "
-                "on its X and Y axes. The corner identifications across a tile seam "
-                "are derived from which tracer cells meet across it, so the center "
-                "coordinates are required. Declare them on the `xgcm.Grid`."
-            )
-        nf, Nyc, Nxc = self.nf, self.Nyc, self.Nxc
-        cid = xr.DataArray(
-            np.arange(nf * Nyc * Nxc, dtype=float).reshape(nf, Nyc, Nxc),
-            dims=(self.facedim, Yc, Xc),
-        )
-        axes = _pad_axes(self.grid, cid.dims)
-        padding = {ax: _seam_or_fill(self.grid.axes[ax].padding) for ax in axes}
-        one = {ax: (1, 1) if ax == "X" else (0, 0) for ax in axes}
-        GX = _module_pad(cid, self.grid, one, padding=padding, fill_value=np.nan)
-        one = {ax: (1, 1) if ax == "Y" else (0, 0) for ax in axes}
-        GY = _module_pad(cid, self.grid, one, padding=padding, fill_value=np.nan)
-        GX = GX.transpose(self.facedim, Yc, Xc).values      # (nf, Nyc, Nxc+2)
-        GY = GY.transpose(self.facedim, Yc, Xc).values      # (nf, Nyc+2, Nxc)
-        return GX, GY
-
     def _face_connection_generators(self):
         """
-        The identification each `face_connections` gluing makes, as an affine map.
+        The identification each `face_connections` gluing makes, read off the
+        declaration itself.
 
-        The map is *fitted* from tracer cells, which pad reliably across any seam
-        however it is rotated or reversed, and then applied along the whole seam
-        line -- including its two end corners, where the cells needed to see the
-        correspondence directly have run out. That is what lets a seam that meets a
-        wall, or a pole, still identify its corners.
+        A gluing says four things: which face, which of its axes, which end of that
+        axis, and whether the tangential index runs the same way. The first three are
+        stated outright (`reverse` means the two faces meet on the *same* side of
+        their axes, which is how `xgcm` checks the links back). The fourth follows
+        from the first three, because a grid is a single oriented surface: crossing
+        the seam flips the outward direction, and the rotation that does so carries
+        the tangential direction with it. Nothing is measured, so a seam that is
+        rotated, reversed, or runs into a wall or a pole is resolved the same way as
+        any other.
         """
         if self.single_tile:
             return []
 
-        GX, GY = self._cell_neighbor_arrays()
-        Nyc, Nxc, nqy, nqx = self.Nyc, self.Nxc, self.nqy, self.nqx
+        fc = self.grid._face_connections[self.facedim]
+        nqy, nqx = self.nqy, self.nqx
 
-        def cell_neighbor(f, jc, ic, d):
-            if d == "left":
-                return GX[f, jc, ic]
-            if d == "right":
-                return GX[f, jc, ic + 2]
-            if d == "down":
-                return GY[f, jc, ic]
-            return GY[f, jc + 2, ic]
-
-        def decode(g):
-            g = int(g)
-            return g // (Nyc * Nxc), (g // Nxc) % Nyc, g % Nxc
+        def line(axis, side):
+            """Corner slots along a face's edge, in tangential order."""
+            if axis == "X":
+                fixed = 0 if side == 0 else nqx - 1
+                return np.arange(nqy), (lambda k: (k, fixed))
+            fixed = 0 if side == 0 else nqy - 1
+            return np.arange(nqx), (lambda k: (fixed, k))
 
         out = []
-        for f in range(self.nf):
-            for side in _SIDES:
-                # cells along this side, in seam order, and the neighbour beyond it
-                if side == "X_low":
-                    cells = [(f, p, 0) for p in range(Nyc)]
-                    outward, seam_corner = "left", lambda p: (p, 0)
-                elif side == "X_high":
-                    cells = [(f, p, Nxc - 1) for p in range(Nyc)]
-                    outward, seam_corner = "right", lambda p: (p, nqx - 1)
-                elif side == "Y_low":
-                    cells = [(f, 0, p) for p in range(Nxc)]
-                    outward, seam_corner = "down", lambda p: (0, p)
-                else:
-                    cells = [(f, Nyc - 1, p) for p in range(Nxc)]
-                    outward, seam_corner = "up", lambda p: (nqy - 1, p)
-
-                nbr = [cell_neighbor(*c, outward) for c in cells]
-                # Which partner (face, back-direction) each position glues to. A
-                # wall pads NaN and glues to nothing.
-                partner = []
-                for c, g in zip(cells, nbr):
-                    if not np.isfinite(g):
-                        partner.append(None)
+        for f, axes in fc.items():
+            for axis, links in axes.items():
+                for side, link in enumerate(links):
+                    if link is None:
                         continue
-                    f2, jc2, ic2 = decode(g)
-                    own = (c[0] * Nyc + c[1]) * Nxc + c[2]
-                    back = [
-                        d for d in _STEPS
-                        if cell_neighbor(f2, jc2, ic2, d) == own
-                    ]
-                    partner.append((f2, jc2, ic2, back[0]) if len(back) == 1 else None)
-
-                for run in _contiguous_runs(partner):
-                    p0, p1 = run                       # inclusive cell range
-                    if p1 == p0:
-                        raise NotImplementedError(
-                            f"Face {f} is glued to another face across a single "
-                            f"cell on its {side} edge. The direction the seam runs "
-                            "in cannot be read from one cell alone; declare this "
-                            "gluing explicitly with an `Identification`."
+                    f2, axis2, rev = link
+                    # `reverse` glues the two faces on the same side of their axes.
+                    side2 = side if rev else 1 - side
+                    ks, slot = line(axis, side)
+                    ks2, slot2 = line(axis2, side2)
+                    if ks.size != ks2.size:
+                        raise ValueError(
+                            f"Face {f}'s {axis} edge is glued to face {f2}'s "
+                            f"{axis2} edge, but they hold {ks.size} and {ks2.size} "
+                            "corners. Two edges that meet must be the same length."
                         )
-                    pairs = []
-                    for p in range(p0, p1):
-                        a = seam_corner(p + 1)
-                        b = _shared_seam_corner(
-                            partner[p], partner[p + 1], Nyc, Nxc, nqy, nqx
-                        )
-                        if b is None:
-                            break
-                        pairs.append((a, b))
-                    if not pairs:
-                        continue
-                    ident = _affine_extend(
-                        partner, run, pairs, seam_corner, nqy, nqx, f, side
+                    if not _tangential_is_forward(axis, side, axis2, side2):
+                        ks2 = ks2[::-1]
+                    a = np.array([(f,) + slot(int(k)) for k in ks], dtype=np.int64)
+                    b = np.array([(f2,) + slot2(int(k)) for k in ks2], dtype=np.int64)
+                    out.append(
+                        Identification(a, b, name=f"face {f} {axis}[{side}] -> face {f2}")
                     )
-                    if ident is not None:
-                        out.append(ident)
         return out
 
     # ------------------------------------------------------------------ build
@@ -935,100 +862,42 @@ def corner_topology(grid, identifications=None):
     return cached
 
 
-def _contiguous_runs(partner):
+# Each edge of a face, as (outward direction, tangential direction) in that face's
+# own (di, dj) basis.
+_EDGE_FRAME = {
+    ("X", 0): ((-1, 0), (0, 1)),
+    ("X", 1): ((1, 0), (0, 1)),
+    ("Y", 0): ((0, -1), (1, 0)),
+    ("Y", 1): ((0, 1), (1, 0)),
+}
+
+
+def _rot90(v, k):
+    for _ in range(k % 4):
+        v = (-v[1], v[0])
+    return v
+
+
+def _tangential_is_forward(axis, side, axis2, side2):
     """
-    Maximal runs of seam positions glued to the same face from the same side.
+    Whether two glued edges run the same way along the seam.
 
-    A tile edge usually glues to exactly one partner over its whole length, but
-    nothing here assumes that: a wall in the middle, or two partners over different
-    stretches, simply yields more than one run.
+    A grid is one oriented surface, so the map between two faces that meet is a
+    rotation, not a reflection. Crossing the seam turns one face's outward direction
+    into the other's inward direction, and there is exactly one rotation that does
+    that; where it sends the tangential direction is then not a choice. So a
+    90-degree gluing reverses the seam even when nothing declares a reversal, and a
+    same-side gluing reverses it too -- both fall out of the same rule rather than
+    needing a case each.
     """
-    runs, start = [], None
-    for p, q in enumerate(partner):
-        key = None if q is None else (q[0], q[3])
-        prev = None if start is None else (partner[start][0], partner[start][3])
-        if key is None:
-            if start is not None:
-                runs.append((start, p - 1))
-                start = None
-        elif start is None:
-            start = p
-        elif key != prev:
-            runs.append((start, p - 1))
-            start = p
-    if start is not None:
-        runs.append((start, len(partner) - 1))
-    return [r for r in runs if r[1] > r[0]]
+    out1, tan1 = _EDGE_FRAME[(axis, side)]
+    out2, tan2 = _EDGE_FRAME[(axis2, side2)]
+    inward2 = (-out2[0], -out2[1])
+    k = next(k for k in range(4) if _rot90(out1, k) == inward2)
+    return _rot90(tan1, k) == tan2
 
 
-def _shared_seam_corner(pa, pb, Nyc, Nxc, nqy, nqx):
-    """
-    The corner on the neighbouring face's seam line shared by two adjacent cells.
 
-    `pa`/`pb` are `(face, j, i, back_direction)` for two cells that are adjacent
-    along the seam. They share an edge, whose two corners are one step apart across
-    the seam line; the one *on* the line is the image of the corner the two cells
-    share on this side.
-    """
-    if pa is None or pb is None or pa[0] != pb[0] or pa[3] != pb[3]:
-        return None
-    _, ja, ia, d = pa
-    _, jb, ib, _ = pb
-    if d in ("left", "right"):
-        # the seam line runs along j, so the two cells must differ in j
-        if ia != ib or abs(ja - jb) != 1:
-            return None
-        return (max(ja, jb), 0 if d == "left" else nqx - 1)
-    if ja != jb or abs(ia - ib) != 1:
-        return None
-    return (0 if d == "down" else nqy - 1, max(ia, ib))
-
-
-def _affine_extend(partner, run, pairs, seam_corner, nqy, nqx, f, side):
-    """
-    Turn one verified corner correspondence into the whole seam line's map.
-
-    The *direction* the neighbouring face's indices run in comes from its cells,
-    which are known at every position of the run; the *offset* comes from a corner
-    pair. Together they give an exact integer map, which is then applied to every
-    corner of the run -- including its two ends, where there is no next cell to read
-    the correspondence from directly. That extension is the whole point: it is what
-    identifies the corners where a seam runs into a wall or a pole.
-    """
-    p0, p1 = run
-    f2 = partner[p0][0]
-    d2 = partner[p0][3]
-    along_j = d2 in ("left", "right")
-
-    def cell_coord(q):
-        return q[1] if along_j else q[2]
-
-    # direction of travel on the neighbouring face, from its cells
-    dc = cell_coord(partner[p1]) - cell_coord(partner[p0])
-    if abs(dc) != (p1 - p0):
-        return None
-    s = 1 if dc > 0 else -1
-
-    # offset, from a verified corner pair
-    (Ja, Ia), (Jb, Ib) = pairs[0]
-    K = Ja if side.startswith("X") else Ia
-    K2 = Jb if along_j else Ib
-    c = K2 - s * K
-
-    Ks = np.arange(p0, p1 + 2)
-    K2s = s * Ks + c
-    n2 = nqy if along_j else nqx
-    if K2s.min() < 0 or K2s.max() >= n2:
-        return None
-
-    a = np.array([(f,) + seam_corner(int(k)) for k in Ks], dtype=np.int64)
-    if along_j:
-        fixed = 0 if d2 == "left" else nqx - 1
-        b = np.stack([np.full_like(K2s, f2), K2s, np.full_like(K2s, fixed)], -1)
-    else:
-        fixed = 0 if d2 == "down" else nqy - 1
-        b = np.stack([np.full_like(K2s, f2), np.full_like(K2s, fixed), K2s], -1)
-    return Identification(a, b, name=f"face {f} {side} -> face {f2}")
 
 
 def _corner_coord_dict(grid):
