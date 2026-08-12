@@ -51,7 +51,9 @@ def test_llc90_outer_topology_builds_and_is_well_formed():
     # it has cells. Anything else means the graph and the mesh disagree.
     for n in range(0, ot.n_nodes, 97):                      # a sample, for speed
         assert deg[n] in (len(ot._cells_around(n)), len(ot._cells_around(n)) + 1)
-    assert int(np.count_nonzero(~native)) == 181   # the dropped outer rows
+    # the corners a 'left' staggering drops along the domain's outer edge, once
+    # the southern boundary fold is declared and its two lips are one line again
+    assert int(np.count_nonzero(~native)) == 78
     import pytest as _pytest
     with _pytest.raises(ValueError, match="stores it on no face"):
         ot.native_of(np.where(~native)[0][:1])

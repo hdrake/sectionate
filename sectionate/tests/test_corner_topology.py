@@ -359,19 +359,30 @@ def test_real_tripolar_grid_matches_its_declaration():
 def test_llc90_resolves_to_the_corner_count_its_seams_imply():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "examples"))
     from load_example_ECCO_grid import load_ECCO_LLC90_grid
+    from sectionate.topology import corner_topology
 
     grid = load_ECCO_LLC90_grid()
-    ct = CornerTopology(grid)
+    # What the grid's own `face_connections` say, and what the loader adds on top.
     # LLC90 stores 13 x 90 x 90 cells, so its 'outer' lattice holds 13 x 91 x 91
-    # corner slots. The tile seams identify them down to this many distinct points;
-    # the number is a property of the grid, and any change to it means the declared
-    # topology has been read differently.
-    assert ct.n_slots == 13 * 91 * 91
-    assert ct.n_nodes == 105481
-    assert int(np.count_nonzero(~ct.node_is_stored)) == 181
+    # corner slots.
+    plain = CornerTopology(grid)
+    assert plain.n_slots == 13 * 91 * 91
+    assert plain.n_nodes == 105481
+    assert int(np.count_nonzero(~plain.node_is_stored)) == 181
+
+    # The southern boundary folds onto itself along the 65E/115W great circle, which
+    # `face_connections` declares as four walls because its schema cannot describe an
+    # edge glued to several partners over different index ranges. Declaring it merges
+    # 179 further corner pairs -- and every one of them is bit-identically coincident
+    # in the archived coordinates, which is a check on the declaration, not its source.
+    ct = corner_topology(grid)          # the loader's, with the fold declared
+    assert ct.n_nodes == 105302
+    assert int(np.count_nonzero(~ct.node_is_stored)) == 78
+    assert ct.validate_positions() == 0.0
     # every tile edge that `face_connections` names is resolved; the four it leaves
-    # `None` are the domain's southern boundary and stay unglued.
-    assert len(ct.identifications) == 13 * 4 - 4
+    # `None` are the domain's southern boundary, which the loader declares separately
+    assert len(plain.identifications) == 13 * 4 - 4
+    assert len(ct.identifications) == 13 * 4 - 4 + 5
     assert (ct.valence <= 4).all()
     # the coordinates agree with the declared topology exactly
     assert ct.validate_positions() == 0.0

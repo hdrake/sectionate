@@ -991,6 +991,32 @@ class CornerTopology:
         return worst
 
 
+def declare_identifications(grid, identifications):
+    """
+    Attach corner identifications a grid's own metadata cannot express, and cache
+    them so everything downstream sees them.
+
+    `face_connections` maps a whole tile edge to a whole tile edge, so it cannot say
+    that one edge is glued to several partners over different index ranges. That is
+    the shape of a lat-lon-cap grid's southern boundary, where the domain's edge
+    folds onto itself across four tile edges, and it is why such a grid is usually
+    published declaring those edges as walls -- leaving one line of physical corners
+    stored twice with nothing to say they are the same.
+
+    Parameters
+    ----------
+    grid : xgcm.Grid
+    identifications : list of Identification
+
+    Returns
+    -------
+    CornerTopology
+    """
+    ct = CornerTopology(grid, identifications=identifications)
+    grid._sectionate_corner_topology = ct
+    return ct
+
+
 def corner_topology(grid, identifications=None):
     """
     The `CornerTopology` of `grid`, cached on the grid instance.
